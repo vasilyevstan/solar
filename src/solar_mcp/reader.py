@@ -1,32 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import os
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from huawei_solar import AsyncHuaweiSolarClient, HuaweiSolarException
 from huawei_solar import register_names as rn
+from huawei_solar.modbus_pdu import PermissionDeniedError
 from huawei_solar.register_definitions import Result
 from huawei_solar.register_values import DEVICE_STATUS_DEFINITIONS
 from huawei_solar.registers import REGISTERS
 from tmodbus import AsyncSmartTransport, AsyncTcpTransport
 from tmodbus.exceptions import TModbusError
 
-from .models import SolarSnapshot
+from .models import GenerationLimit, GenerationLimitChange, SolarSnapshot
 
 LOGGER = logging.getLogger(__name__)
 CACHE_SECONDS = 30.0
 REFRESH_TIMEOUT_SECONDS = 30.0
 CLOSE_TIMEOUT_SECONDS = 2.0
+CAP_REGISTER = REGISTERS[rn.ACTIVE_POWER_PERCENTAGE_DERATING].register
 
 
 class SolarReadError(Exception):
     """A telemetry failure safe to report to the MCP client."""
+
+
+class SolarControlError(Exception):
+    """A cap-control failure safe to report to the MCP client."""
 
 
 @dataclass(frozen=True)
@@ -35,6 +46,11 @@ class HuaweiConfig:
     port: int = 502
     unit_id: int = 1
     expected_serial: str | None = None
+    allow_control: bool = False
+    control_log: Path = field(
+        default_factory=lambda: Path.home() / ".local/state/solar-mcp/generation-caps.jsonl"
+    )
+    installer_password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.host or any(c.isspace() for c in self.host) or "/" in self.host:
@@ -47,6 +63,14 @@ class HuaweiConfig:
             not self.expected_serial.strip() or not self.expected_serial.isprintable()
         ):
             raise ValueError("Expected serial must be nonempty printable text.")
+        if type(self.allow_control) is not bool:
+            raise ValueError("Control enablement must be a boolean.")
+        if self.allow_control and self.expected_serial is None:
+            raise ValueError("SOLAR_EXPECTED_SERIAL is required when generation-cap control is enabled.")
+        if self.allow_control and not self.control_log.is_absolute():
+            raise ValueError("SOLAR_CONTROL_LOG must be an absolute path.")
+        if self.installer_password is not None and not self.installer_password:
+            raise ValueError("SOLAR_INSTALLER_PASSWORD must not be empty when configured.")
 
 
 class ReadClient(Protocol):
@@ -62,6 +86,12 @@ class ReadClient(Protocol):
     async def get_multiple(self, names: list[rn.RegisterName]) -> list[Result[object]]: ...
 
     async def read_holding_registers(self, start_address: int, quantity: int) -> list[int]: ...
+
+    async def set(self, name: rn.RegisterName, value: float) -> bool: ...
+
+    async def login(self, username: str, password: str) -> bool: ...
+
+    async def heartbeat(self) -> bool: ...
 
 
 def create_read_client(config: HuaweiConfig) -> ReadClient:
@@ -92,6 +122,15 @@ def _number(value: object, field: str, *, nonnegative: bool = False) -> float:
     return number
 
 
+def _percent_tenths(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SolarControlError("A percentage must be a number from 0 to 100, in steps of 0.1.")
+    scaled = Decimal(str(value)) * 10
+    if not scaled.is_finite() or not 0 <= scaled <= 1000 or scaled != scaled.to_integral_value():
+        raise SolarControlError("A percentage must be a number from 0 to 100, in steps of 0.1.")
+    return int(scaled)
+
+
 class HuaweiSolarReader:
     def __init__(
         self,
@@ -110,6 +149,10 @@ class HuaweiSolarReader:
         self._last_observation: datetime | None = None
         self._lock = asyncio.Lock()
         self._closed = False
+
+    @property
+    def control_enabled(self) -> bool:
+        return self._config.allow_control
 
     async def _disconnect(self) -> None:
         client, self._client = self._client, None
@@ -132,7 +175,12 @@ class HuaweiSolarReader:
         await self._disconnect()
         self._client = self._client_factory(self._config)
         await self._client.connect()
-        identity = await self._client.get_multiple([rn.MODEL_NAME, rn.SERIAL_NUMBER])
+        await self._verify_identity(self._client)
+        self._version = _text((await self._client.get(rn.SOFTWARE_VERSION)).value, "software version")
+        return self._client
+
+    async def _verify_identity(self, client: ReadClient) -> None:
+        identity = await client.get_multiple([rn.MODEL_NAME, rn.SERIAL_NUMBER])
         if len(identity) != 2:
             raise SolarReadError("Incomplete inverter identity.")
         model = _text(identity[0].value, "inverter model")
@@ -143,10 +191,146 @@ class HuaweiSolarReader:
             raise SolarReadError("Inverter identity does not match SOLAR_EXPECTED_SERIAL.")
         if self._identity is not None and self._identity != (model, serial):
             raise SolarReadError("Inverter identity changed since the previous connection.")
-        self._version = _text((await self._client.get(rn.SOFTWARE_VERSION)).value, "software version")
         self._model = model
         self._identity = model, serial
-        return self._client
+
+    async def _cap_operation[T](self, operation: Callable[[ReadClient], Awaitable[T]]) -> T:
+        async with self._lock:
+            if self._closed:
+                raise SolarControlError("The inverter reader is closed.")
+            try:
+                return await operation(await self._connect())
+            except (SolarReadError, SolarControlError, HuaweiSolarException, TModbusError, OSError):
+                self._cache = None
+                await self._disconnect()
+                raise
+            except asyncio.CancelledError:
+                self._cache = None
+                await self._disconnect()
+                raise
+
+    async def _read_generation_limit(self, client: ReadClient) -> GenerationLimit:
+        configured = _percent_tenths((await client.get(rn.ACTIVE_POWER_PERCENTAGE_DERATING)).value)
+        values = await client.get_multiple(
+            [
+                rn.ACTIVE_POWER_ADJUSTMENT_MODE,
+                rn.ACTIVE_POWER_ADJUSTMENT_VALUE,
+                rn.ACTIVE_POWER_ADJUSTMENT_COMMAND,
+            ]
+        )
+        if len(values) != 3 or any(type(result.value) is not int for result in values):
+            raise SolarControlError("Invalid or missing active generation-cap data.")
+        mode, active, command = (result.value for result in values)
+        if mode != 0 or command != CAP_REGISTER:
+            raise SolarControlError(
+                "The inverter is not using the supported percentage-cap mode. "
+                "Refusing to replace another control mode."
+            )
+        if not isinstance(active, int) or not 0 <= active <= 1000:
+            raise SolarControlError("Invalid active generation-cap percentage.")
+        return GenerationLimit(
+            observed_at=datetime.now(UTC),
+            percent=configured / 10,
+            active_percent=active / 10,
+            control_enabled=self.control_enabled,
+        )
+
+    async def get_generation_limit(self) -> GenerationLimit:
+        try:
+            async with asyncio.timeout(REFRESH_TIMEOUT_SECONDS):
+                return await self._cap_operation(self._read_generation_limit)
+        except (SolarReadError, SolarControlError) as error:
+            raise SolarControlError(str(error)) from error
+        except (HuaweiSolarException, TModbusError, OSError) as error:
+            raise SolarControlError(
+                f"Generation-cap read failed ({type(error).__name__}); no current cap is available."
+            ) from error
+
+    def _record_cap_event(self, record: dict[str, object], event: str) -> None:
+        path = self._config.control_log
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as log:
+            os.fchmod(log.fileno(), 0o600)
+            log.write(json.dumps({**record, "event": event, "at": datetime.now(UTC).isoformat()}) + "\n")
+            log.flush()
+            os.fsync(log.fileno())
+
+    async def set_generation_limit(
+        self, percent: float, expected_current_percent: float
+    ) -> GenerationLimitChange:
+        if not self.control_enabled:
+            raise SolarControlError("Generation-cap control is disabled; set SOLAR_ALLOW_CONTROL=1 locally.")
+        requested = _percent_tenths(percent)
+        expected = _percent_tenths(expected_current_percent)
+        write_attempted = False
+
+        async def change(client: ReadClient) -> GenerationLimitChange:
+            nonlocal write_attempted
+            await self._verify_identity(client)
+            previous = await self._read_generation_limit(client)
+            if previous.percent != expected / 10 or previous.active_percent != previous.percent:
+                raise SolarControlError(
+                    "The current cap differs from the expected value or active readback. "
+                    "Read get_generation_limit again; no cap write was attempted."
+                )
+            if requested == expected:
+                return GenerationLimitChange(previous.percent, previous, False, None)
+            if self._config.installer_password is not None:
+                if not await client.login("installer", self._config.installer_password):
+                    raise SolarControlError("Installer login failed; no cap write was attempted.")
+                if not await client.heartbeat():
+                    raise SolarControlError("Installer session heartbeat failed; no cap write was attempted.")
+                current = await self._read_generation_limit(client)
+                if current.percent != previous.percent or current.active_percent != previous.active_percent:
+                    raise SolarControlError("The cap changed during login; no cap write was attempted.")
+            request_id = str(uuid4())
+            record: dict[str, object] = {
+                "request_id": request_id,
+                "model": self._model,
+                "serial": self._config.expected_serial,
+                "previous_percent": previous.percent,
+                "requested_percent": requested / 10,
+            }
+            self._record_cap_event(record, "prepared")
+            self._cache = None
+            write_attempted = True
+            acknowledged = await client.set(rn.ACTIVE_POWER_PERCENTAGE_DERATING, requested / 10)
+            if not acknowledged:
+                raise SolarControlError("The inverter did not acknowledge the requested cap.")
+            for attempt in range(3):
+                actual = await self._read_generation_limit(client)
+                if actual.percent == requested / 10 and actual.active_percent == requested / 10:
+                    self._record_cap_event(record, "verified")
+                    return GenerationLimitChange(previous.percent, actual, True, request_id)
+                if attempt < 2:
+                    await asyncio.sleep(0.25)
+            raise SolarControlError("The configured and active cap did not both match the request.")
+
+        try:
+            async with asyncio.timeout(REFRESH_TIMEOUT_SECONDS):
+                return await self._cap_operation(change)
+        except PermissionDeniedError as error:
+            message = (
+                "The inverter denied write permission. Check local installer permissions; "
+                "if required, configure SOLAR_INSTALLER_PASSWORD locally. No write was retried."
+            )
+            cause: Exception = error
+        except (SolarReadError, SolarControlError) as error:
+            message, cause = str(error), error
+        except (HuaweiSolarException, TModbusError, OSError) as error:
+            message = f"Generation-cap operation failed ({type(error).__name__})."
+            cause = error
+        except asyncio.CancelledError:
+            if write_attempted:
+                LOGGER.error("Cap request cancelled after transmission began; read the cap before any further change.")
+            raise
+        if write_attempted:
+            message += (
+                " The cap may have changed. Read get_generation_limit before retrying or restoring. "
+                "The previous value and intent are saved in SOLAR_CONTROL_LOG; no automatic rollback was attempted."
+            )
+        raise SolarControlError(message) from cause
 
     async def _refresh(self) -> SolarSnapshot:
         client = await self._connect()

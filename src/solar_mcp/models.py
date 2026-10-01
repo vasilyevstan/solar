@@ -16,3 +16,19 @@ class SolarSnapshot:
     daily_yield_kwh: float
     lifetime_yield_kwh: float
     source: Literal["huawei_modbus"] = "huawei_modbus"
+
+
+@dataclass(frozen=True)
+class GenerationLimit:
+    observed_at: datetime
+    percent: float
+    active_percent: float
+    control_enabled: bool
+
+
+@dataclass(frozen=True)
+class GenerationLimitChange:
+    previous_percent: float
+    limit: GenerationLimit
+    changed: bool
+    request_id: str | None

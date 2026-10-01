@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solar-mcp"
-version = "0.1.0"
-description = "Read-only local Huawei inverter telemetry over MCP"
+version = "0.2.0"
+description = "Local Huawei inverter telemetry and opt-in generation caps over MCP"
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
@@ -13,6 +13,7 @@ requires-python = ">=3.12"
 dependencies = [
     "huawei-solar==3.0.7",
     "mcp==2.2.0",
+    "pydantic==2.13.5",
     "tmodbus==0.6.2",
 ]
 

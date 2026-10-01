@@ -9,3 +9,4 @@ dist/
 state/
 docs/
 *.log
+*.jsonl

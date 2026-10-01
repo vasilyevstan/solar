@@ -21,6 +21,9 @@ class ModbusStub:
         self.registers: dict[int, int] = {}
         self.connections: set[asyncio.StreamWriter] = set()
         self.fail_reads = False
+        self.allow_writes = False
+        self.put_words(35300, [0, 0, 1000, 40125])
+        self.put_words(40125, [1000])
         self.put_text(30000, 15, "SUN2000-8KTL-M0")
         self.put_text(30015, 10, "TEST-INVERTER-0001")
         self.put_text(30050, 15, "TEST-FIRMWARE")
@@ -46,7 +49,14 @@ class ModbusStub:
                 function = pdu[0]
                 address, count = struct.unpack(">HH", pdu[1:]) if len(pdu) == 5 else (-1, -1)
                 self.requests.append((unit, function, address, count))
-                if function != 3:
+                if function == 6 and address == 40125:
+                    if self.allow_writes:
+                        self.put_words(40125, [count])
+                        self.put_words(35301, [0, count])
+                        response = pdu
+                    else:
+                        response = b"\x86\x80"
+                elif function != 3:
                     response = bytes([function | 0x80, 1])
                 elif self.fail_reads:
                     response = b"\x83\x04"
@@ -84,18 +94,33 @@ def test_stdio_tool_schema_live_cache_errors_and_read_only_wire_contract() -> No
             parameters = StdioServerParameters(
                 command=sys.executable,
                 args=["-m", "solar_mcp.server", "--inverter-host", "127.0.0.1", "--inverter-port", str(port)],
-                env={"SOLAR_EXPECTED_SERIAL": "TEST-INVERTER-0001", "SOLAR_INVERTER_UNIT_ID": "1"},
+                env={
+                    "SOLAR_EXPECTED_SERIAL": "TEST-INVERTER-0001",
+                    "SOLAR_INVERTER_UNIT_ID": "1",
+                    "SOLAR_ALLOW_CONTROL": "0",
+                },
             )
             async with stdio_client(parameters) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tools = (await session.list_tools()).tools
-                    assert [tool.name for tool in tools] == ["get_solar_status"]
+                    assert [tool.name for tool in tools] == ["get_solar_status", "get_generation_limit"]
+                    assert all(tool.annotations.read_only_hint for tool in tools)
                     assert tools[0].annotations is not None
                     assert tools[0].annotations.read_only_hint is True
                     assert tools[0].annotations.destructive_hint is False
                     assert tools[0].input_schema["properties"] == {}
                     assert tools[0].output_schema is not None
+                    forbidden = await session.call_tool(
+                        "set_generation_limit", {"percent": 50, "expected_current_percent": 100}
+                    )
+                    assert forbidden.is_error
+                    assert not stub.requests
+                    limit = await session.call_tool("get_generation_limit", {})
+                    assert not limit.is_error
+                    assert limit.structured_content["percent"] == 100
+                    assert limit.structured_content["active_percent"] == 100
+                    assert limit.structured_content["control_enabled"] is False
                     result = await session.call_tool("get_solar_status", {})
                     assert not result.is_error
                     data = result.structured_content
@@ -132,7 +157,10 @@ def test_stdio_tool_schema_live_cache_errors_and_read_only_wire_contract() -> No
                     assert recovered.structured_content["from_cache"] is False
             await asyncio.sleep(0.05)
             assert not stub.connections
-        allowed = {(30000, 25), (30050, 15), (32080, 2), (32089, 1), (32106, 2), (32114, 2)}
+        allowed = {
+            (30000, 25), (30050, 15), (32080, 2), (32089, 1), (32106, 2), (32114, 2),
+            (35300, 4), (40125, 1),
+        }
         assert stub.requests
         assert all(unit == 1 and function == 3 and (address, count) in allowed
                    for unit, function, address, count in stub.requests)
@@ -191,3 +219,86 @@ def test_missing_configuration_is_stderr_only() -> None:
     assert result.returncode == 2
     assert result.stdout == ""
     assert "Set SOLAR_INVERTER_HOST" in result.stderr
+
+
+def test_stdio_percentage_control_schema_precise_write_readback_restore_and_permission_error(tmp_path) -> None:
+    async def check() -> None:
+        stub = ModbusStub()
+        stub.allow_writes = True
+        async with stub.serve() as port:
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "solar_mcp.server", "--inverter-host", "127.0.0.1", "--inverter-port", str(port)],
+                env={
+                    "SOLAR_EXPECTED_SERIAL": "TEST-INVERTER-0001",
+                    "SOLAR_INVERTER_UNIT_ID": "1",
+                    "SOLAR_ALLOW_CONTROL": "1",
+                    "SOLAR_CONTROL_LOG": str(tmp_path / "caps.jsonl"),
+                },
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                    assert set(tools) == {"get_solar_status", "get_generation_limit", "set_generation_limit"}
+                    setter = tools["set_generation_limit"]
+                    assert not setter.annotations.read_only_hint
+                    assert setter.annotations.destructive_hint
+                    assert not setter.annotations.idempotent_hint
+                    assert set(setter.input_schema["required"]) == {"percent", "expected_current_percent"}
+                    schema = setter.input_schema["properties"]["percent"]
+                    assert schema["minimum"] == 0 and schema["maximum"] == 100
+                    assert schema["multipleOf"] == 0.1
+                    for invalid in [-1, 101, 12.34, True, "50"]:
+                        rejected = await session.call_tool(
+                            "set_generation_limit", {"percent": invalid, "expected_current_percent": 100}
+                        )
+                        assert rejected.is_error
+                    assert not stub.requests
+                    for percent, expected in [(57.9, 100), (0, 57.9), (100, 0)]:
+                        result = await session.call_tool(
+                            "set_generation_limit", {"percent": percent, "expected_current_percent": expected}
+                        )
+                        assert not result.is_error, str(result.content)
+                        data = result.structured_content
+                        assert data["previous_percent"] == expected
+                        assert data["limit"]["percent"] == data["limit"]["active_percent"] == percent
+                        assert data["changed"] is True
+                    stale = await session.call_tool(
+                        "set_generation_limit", {"percent": 50, "expected_current_percent": 0}
+                    )
+                    assert stale.is_error
+                    stub.allow_writes = False
+                    denied = await session.call_tool(
+                        "set_generation_limit", {"percent": 50, "expected_current_percent": 100}
+                    )
+                    assert denied.is_error and denied.structured_content is None
+                    assert "denied write permission" in str(denied.content)
+                    assert stub.registers[40125] == 1000
+        writes = [(address, value) for _, function, address, value in stub.requests if function != 3]
+        assert writes == [(40125, 579), (40125, 0), (40125, 1000), (40125, 500)]
+        assert all(unit == 1 and function in {3, 6} for unit, function, _, _ in stub.requests)
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"SOLAR_ALLOW_CONTROL": "yes"}, "must be 0 or 1"),
+        ({"SOLAR_ALLOW_CONTROL": "1"}, "SOLAR_EXPECTED_SERIAL is required"),
+        (
+            {"SOLAR_ALLOW_CONTROL": "1", "SOLAR_EXPECTED_SERIAL": "TEST", "SOLAR_CONTROL_LOG": "relative"},
+            "must be an absolute path",
+        ),
+    ],
+)
+def test_invalid_control_configuration_is_stderr_only(settings, message) -> None:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("SOLAR_")}
+    environment.update(SOLAR_INVERTER_HOST="127.0.0.1", **settings)
+    result = subprocess.run(
+        [sys.executable, "-m", "solar_mcp.server"], env=environment, capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert message in result.stderr

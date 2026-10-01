@@ -55,6 +55,15 @@ class FakeClient:
         assert (start_address, quantity) == (32089, 1)
         return self.status
 
+    async def set(self, name: rn.RegisterName, value: float) -> bool:
+        raise AssertionError("Read-only client must not write")
+
+    async def login(self, username: str, password: str) -> bool:
+        raise AssertionError("Read-only client must not log in")
+
+    async def heartbeat(self) -> bool:
+        raise AssertionError("Read-only client must not send heartbeats")
+
     def __getattr__(self, name: str) -> object:
         raise AssertionError(f"Unexpected client operation (including any login/write): {name}")
 

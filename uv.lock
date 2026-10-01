@@ -672,11 +672,12 @@ wheels = [
 
 [[package]]
 name = "solar-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "huawei-solar" },
     { name = "mcp" },
+    { name = "pydantic" },
     { name = "tmodbus" },
 ]
 
@@ -689,6 +690,7 @@ dev = [
 requires-dist = [
     { name = "huawei-solar", specifier = "==3.0.7" },
     { name = "mcp", specifier = "==2.2.0" },
+    { name = "pydantic", specifier = "==2.13.5" },
     { name = "tmodbus", specifier = "==0.6.2" },
 ]
 
