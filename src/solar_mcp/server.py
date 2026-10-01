@@ -40,7 +40,8 @@ def create_server(reader: HuaweiSolarReader) -> MCPServer[None]:
             + (
                 "Only change the cap for an explicit user request. Read the current cap first. "
                 "Changes can persist after shutdown; never assume an error means the old cap remains. "
-                "Restore a saved previous percentage with the same setter and a fresh expected value."
+                "Configured and active percentages can differ; never claim an active cap from stored configuration alone. "
+                "Restore a saved previous percentage with the same setter and fresh configured/active expectations."
                 if reader.control_enabled
                 else "Control is disabled; no write tools are available."
             )
@@ -83,18 +84,24 @@ def create_server(reader: HuaweiSolarReader) -> MCPServer[None]:
             )
         )
         async def set_generation_limit(
-            percent: Percentage, expected_current_percent: Percentage
+            percent: Percentage,
+            expected_current_percent: Percentage,
+            expected_active_percent: Percentage | None = None,
         ) -> GenerationLimitChange:
             """Set a user-requested percentage power cap (0-100, step 0.1), not a kWh/export limit.
 
-            Read get_generation_limit first and pass its percent as expected_current_percent.
+            Read get_generation_limit first. Pass its percent as expected_current_percent and
+            its active_percent as expected_active_percent (defaults to expected_current_percent).
             Zero can stop generation; 100 removes this percentage restriction, not other limits.
             Only existing percentage mode is supported. No blind retries or automatic rollback.
-            To restore, set the saved previous_percent with the freshly read current percentage.
+            To restore, set the saved previous_percent with both freshly read expectations.
+            Configuration is verified separately from active readback; heed the warning when they differ.
             An unchanged result does not test write permission.
             """
             try:
-                return await reader.set_generation_limit(percent, expected_current_percent)
+                return await reader.set_generation_limit(
+                    percent, expected_current_percent, expected_active_percent
+                )
             except SolarControlError as error:
                 LOGGER.warning("%s", error)
                 raise ToolError(str(error)) from None

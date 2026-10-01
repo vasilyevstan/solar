@@ -32,3 +32,6 @@ class GenerationLimitChange:
     limit: GenerationLimit
     changed: bool
     request_id: str | None
+    active_readback_matches: bool
+    warning: str | None
+    configuration_verified: Literal[True] = True

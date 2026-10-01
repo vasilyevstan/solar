@@ -131,6 +131,20 @@ def _percent_tenths(value: object) -> int:
     return int(scaled)
 
 
+def _change_result(
+    previous: float, actual: GenerationLimit, *, changed: bool, request_id: str | None
+) -> GenerationLimitChange:
+    active_matches = actual.percent == actual.active_percent
+    warning = None
+    if not active_matches:
+        warning = (
+            "The configured cap is verified, but the active-adjustment readback differs. "
+            "The output restriction is not confirmed; it may be pending or overridden."
+        )
+        LOGGER.warning("%s", warning)
+    return GenerationLimitChange(previous, actual, changed, request_id, active_matches, warning)
+
+
 class HuaweiSolarReader:
     def __init__(
         self,
@@ -257,25 +271,29 @@ class HuaweiSolarReader:
             os.fsync(log.fileno())
 
     async def set_generation_limit(
-        self, percent: float, expected_current_percent: float
+        self,
+        percent: float,
+        expected_current_percent: float,
+        expected_active_percent: float | None = None,
     ) -> GenerationLimitChange:
         if not self.control_enabled:
             raise SolarControlError("Generation-cap control is disabled; set SOLAR_ALLOW_CONTROL=1 locally.")
         requested = _percent_tenths(percent)
         expected = _percent_tenths(expected_current_percent)
+        expected_active = expected if expected_active_percent is None else _percent_tenths(expected_active_percent)
         write_attempted = False
 
         async def change(client: ReadClient) -> GenerationLimitChange:
             nonlocal write_attempted
             await self._verify_identity(client)
             previous = await self._read_generation_limit(client)
-            if previous.percent != expected / 10 or previous.active_percent != previous.percent:
+            if previous.percent != expected / 10 or previous.active_percent != expected_active / 10:
                 raise SolarControlError(
                     "The current cap differs from the expected value or active readback. "
                     "Read get_generation_limit again; no cap write was attempted."
                 )
             if requested == expected:
-                return GenerationLimitChange(previous.percent, previous, False, None)
+                return _change_result(previous.percent, previous, changed=False, request_id=None)
             if self._config.installer_password is not None:
                 if not await client.login("installer", self._config.installer_password):
                     raise SolarControlError("Installer login failed; no cap write was attempted.")
@@ -290,6 +308,7 @@ class HuaweiSolarReader:
                 "model": self._model,
                 "serial": self._config.expected_serial,
                 "previous_percent": previous.percent,
+                "previous_active_percent": previous.active_percent,
                 "requested_percent": requested / 10,
             }
             self._record_cap_event(record, "prepared")
@@ -301,11 +320,20 @@ class HuaweiSolarReader:
             for attempt in range(3):
                 actual = await self._read_generation_limit(client)
                 if actual.percent == requested / 10 and actual.active_percent == requested / 10:
-                    self._record_cap_event(record, "verified")
-                    return GenerationLimitChange(previous.percent, actual, True, request_id)
+                    break
                 if attempt < 2:
                     await asyncio.sleep(0.25)
-            raise SolarControlError("The configured and active cap did not both match the request.")
+            if actual.percent != requested / 10:
+                raise SolarControlError("The configured cap did not match the request.")
+            self._record_cap_event(
+                {
+                    **record,
+                    "active_percent": actual.active_percent,
+                    "active_readback_matches": actual.active_percent == actual.percent,
+                },
+                "verified",
+            )
+            return _change_result(previous.percent, actual, changed=True, request_id=request_id)
 
         try:
             async with asyncio.timeout(REFRESH_TIMEOUT_SECONDS):

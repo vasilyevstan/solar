@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solar-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local Huawei inverter telemetry and opt-in generation caps over MCP"
 readme = "README.md"
 license = "AGPL-3.0-only"

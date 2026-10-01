@@ -33,6 +33,7 @@ class CapClient(FakeClient):
         self.heartbeat_succeeds = True
         self.write_error: Exception | None = None
         self.apply_write = True
+        self.update_active = True
         self.write_delay = 0.0
         self.write_started = asyncio.Event()
         self.log_path: Path | None = None
@@ -50,7 +51,8 @@ class CapClient(FakeClient):
             raise self.write_error
         if self.apply_write:
             self.values[rn.ACTIVE_POWER_PERCENTAGE_DERATING] = value / 10
-            self.values[rn.ACTIVE_POWER_ADJUSTMENT_VALUE] = value
+            if self.update_active:
+                self.values[rn.ACTIVE_POWER_ADJUSTMENT_VALUE] = value
         await asyncio.sleep(self.write_delay)
         return True
 
@@ -96,6 +98,9 @@ def test_invalid_target_or_expectation_performs_no_io(tmp_path: Path, value: obj
             await reader.set_generation_limit(value, 100)
         with pytest.raises(SolarControlError, match="steps of 0.1"):
             await reader.set_generation_limit(50, value)
+        if value is not None:
+            with pytest.raises(SolarControlError, match="steps of 0.1"):
+                await reader.set_generation_limit(50, 100, value)
         assert client.connects == 0
         assert not client.writes
         assert not client.log_path.exists()
@@ -147,6 +152,8 @@ def test_verified_change_journal_cache_invalidation_and_guarded_restoration(
         assert result.previous_percent == 100
         assert result.limit.percent == result.limit.active_percent == percent
         assert result.request_id is not None
+        assert result.configuration_verified and result.active_readback_matches
+        assert result.warning is None
         assert client.writes == [(40125, _percent_tenths(percent))]
         assert client.login_count == client.heartbeat_count == 0
         assert not (await reader.read()).from_cache
@@ -250,10 +257,38 @@ def test_unchanged_readback_is_not_reported_as_success(tmp_path: Path) -> None:
         client = CapClient()
         client.apply_write = False
         reader = make_controller(client, tmp_path)
-        with pytest.raises(SolarControlError, match="did not both match"):
+        with pytest.raises(SolarControlError, match="configured cap did not match"):
             await reader.set_generation_limit(50, 100)
         assert client.writes == [(40125, 500)]
         assert len(client.log_path.read_text().splitlines()) == 1
+        await reader.close()
+
+    asyncio.run(check())
+
+
+def test_mixed_readback_is_explicit_and_can_be_restored_with_fresh_expectations(tmp_path: Path) -> None:
+    async def check() -> None:
+        client = CapClient()
+        client.update_active = False
+        reader = make_controller(client, tmp_path)
+        changed = await reader.set_generation_limit(99, 100, 100)
+        assert changed.changed and changed.configuration_verified
+        assert changed.limit.percent == 99 and changed.limit.active_percent == 100
+        assert not changed.active_readback_matches
+        assert "output restriction is not confirmed" in changed.warning
+        records = [json.loads(line) for line in client.log_path.read_text().splitlines()]
+        assert records[-1]["event"] == "verified"
+        assert records[-1]["active_readback_matches"] is False
+        with pytest.raises(SolarControlError, match="current cap differs"):
+            await reader.set_generation_limit(100, 99)
+        current = await reader.get_generation_limit()
+        restored = await reader.set_generation_limit(
+            changed.previous_percent, current.percent, current.active_percent
+        )
+        assert restored.changed and restored.active_readback_matches
+        assert restored.warning is None
+        assert restored.limit.percent == restored.limit.active_percent == 100
+        assert client.writes == [(40125, 990), (40125, 1000)]
         await reader.close()
 
     asyncio.run(check())

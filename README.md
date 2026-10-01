@@ -23,9 +23,9 @@ for an explicit cap change when an installer password has been configured.
 - The inverter's unit ID. The verified SUN2000-8KTL-M0 / SDongleA-05 installation
   uses **unit 1**, not the library's unit-0 default.
 
-Only telemetry and cap **reads** on that inverter/dongle combination have been
-exercised on hardware. Live write permission and physical curtailment have not yet
-been verified. Cap writes are covered using simulated devices and the real library.
+Telemetry, percentage-cap configuration writes, and restoration on that
+inverter/dongle combination have been exercised on hardware. Physical curtailment
+under sufficient sunlight has not yet been verified.
 Other SUN2000 models must provide the same registers; missing data is an error rather
 than an invented reading. Software updates and commissioning are outside this
 server's scope. Do not start it during an active firmware update.
@@ -148,8 +148,8 @@ fixed-watt or other control modes, and does not change maximum hardware power.
 `get_generation_limit` has no arguments and never uses a cache. It returns
 `percent` (configured), `active_percent` (active adjustment readback),
 `observed_at` (UTC), and `control_enabled`. Unsupported modes and invalid
-register values are explicit errors. A mismatch between configured and active
-values prevents writing; do not assume the requested cap has taken effect.
+register values are explicit errors. Configured and active values can differ;
+do not assume a stored cap has taken effect.
 
 ### Enable and use control
 
@@ -168,16 +168,22 @@ the server does not guess credentials or retry failed writes.
 
 For an explicitly requested percentage change:
 
-1. Call `get_generation_limit` and check that `percent` and `active_percent` agree.
-2. Call `set_generation_limit` with `percent` and the freshly read `expected_current_percent`, both numeric values in **0.1% steps, from 0 to 100**.
-3. Keep the result's `previous_percent` if you intend to restore it. Restore explicitly using the same setter with that previous percentage and a new current-value expectation.
+1. Call `get_generation_limit` and inspect both `percent` and `active_percent`.
+2. Call `set_generation_limit` with the requested `percent`, `expected_current_percent` from the configured readback, and `expected_active_percent` from the active readback. All are numeric values in **0.1% steps, from 0 to 100**.
+3. Keep the result's `previous_percent` if you intend to restore it. Restore explicitly using the same setter with that previous percentage and both freshly read expectations.
+
+`expected_active_percent` defaults to `expected_current_percent` for callers
+whose readbacks agree. When they differ, supply the actual active expectation
+explicitly; otherwise the setter rejects the request without writing. This also
+allows guarded restoration of a stored change that has not become active.
 
 For example, only when the current cap is 100% and you actually want 50%:
 
 ```json
 {
   "percent": 50.0,
-  "expected_current_percent": 100.0
+  "expected_current_percent": 100.0,
+  "expected_active_percent": 100.0
 }
 ```
 
@@ -187,19 +193,29 @@ other inverter limits. A request for the already active value returns
 permission.
 
 The setter serializes with reads, checks device identity again, rejects stale
-expectations, and durably saves the previous value and intent before sending
-one exact function-06 write to `40125`. It checks the write acknowledgment and
-both configured and active cap values before returning `changed: true`. It may
-read back up to three times, but **never automatically retries a cap write**.
-Readback verifies the settings, not the actual reduction in generation;
-physical curtailment must be checked separately while sufficient sunlight exists.
+configured or active expectations, and durably saves the previous value and
+intent before sending one function-06 write to `40125` through the Huawei library.
+It checks the acknowledgment and configured cap before returning `changed: true`
+with `configuration_verified: true`. It also reads the active adjustment, up to
+three times, but **never automatically retries a cap write**.
+
+`changed: true` means the **stored setting** changed, not that output is already
+limited. `active_readback_matches` reports whether the active adjustment agrees.
+If it does not, the result includes a warning: the cap may be pending or overridden,
+and its output restriction is unconfirmed. This distinction is necessary because
+the two readbacks can differ while the inverter is in no-irradiation standby.
+Physical curtailment must be checked separately while sufficient sunlight exists.
+The hardware check changed the stored cap from 100% to 99% and restored 100%;
+the active readback stayed at 100% in standby. Both final readbacks were 100%.
 
 **Treat changes as persistent.** Exiting or disconnecting does not trigger a
 restore. If a write times out, is cancelled, or fails verification, it may still
 have applied. Read the current cap before any further action; do not blindly
 retry or assume the original cap was restored. The private journal contains
-paired `prepared`/`verified` records, including previous/requested percentages
-and a request ID. An unpaired `prepared` record has an uncertain outcome and
+paired `prepared`/`verified` records, including previous/requested percentages,
+active readback, and a request ID. `verified` means the configured value was
+verified; its `active_readback_matches` field records the separate active result.
+An unpaired `prepared` record has an uncertain outcome and
 preserves the information needed for an explicit recovery.
 
 The journal is permission-restricted and must be writable; inability to persist
@@ -222,7 +238,8 @@ Tests use fake clients and a loopback Modbus server, not physical hardware. The 
 schemas and errors, assert that default-mode traffic is only function-03 reads,
 and check the exact function-06 percentage words in opt-in mode. Tests also cover
 identity and expected-value checks, durable intent, permission failures, explicit
-restoration, cancellation, serialization, and unchanged monitoring behavior.
+restoration with differing stored/active readbacks, cancellation, serialization,
+and unchanged monitoring behavior.
 
 ## License and dependencies
 

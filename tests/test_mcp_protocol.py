@@ -22,6 +22,7 @@ class ModbusStub:
         self.connections: set[asyncio.StreamWriter] = set()
         self.fail_reads = False
         self.allow_writes = False
+        self.update_active_on_write = True
         self.put_words(35300, [0, 0, 1000, 40125])
         self.put_words(40125, [1000])
         self.put_text(30000, 15, "SUN2000-8KTL-M0")
@@ -52,7 +53,8 @@ class ModbusStub:
                 if function == 6 and address == 40125:
                     if self.allow_writes:
                         self.put_words(40125, [count])
-                        self.put_words(35301, [0, count])
+                        if self.update_active_on_write:
+                            self.put_words(35301, [0, count])
                         response = pdu
                     else:
                         response = b"\x86\x80"
@@ -249,11 +251,11 @@ def test_stdio_percentage_control_schema_precise_write_readback_restore_and_perm
                     schema = setter.input_schema["properties"]["percent"]
                     assert schema["minimum"] == 0 and schema["maximum"] == 100
                     assert schema["multipleOf"] == 0.1
-                    for invalid in [-1, 101, 12.34, True, "50"]:
-                        rejected = await session.call_tool(
-                            "set_generation_limit", {"percent": invalid, "expected_current_percent": 100}
-                        )
-                        assert rejected.is_error
+                    for field in ["percent", "expected_current_percent", "expected_active_percent"]:
+                        for invalid in [-1, 101, 12.34, True, "50"]:
+                            arguments = {"percent": 50, "expected_current_percent": 100, field: invalid}
+                            rejected = await session.call_tool("set_generation_limit", arguments)
+                            assert rejected.is_error
                     assert not stub.requests
                     for percent, expected in [(57.9, 100), (0, 57.9), (100, 0)]:
                         result = await session.call_tool(
@@ -264,6 +266,8 @@ def test_stdio_percentage_control_schema_precise_write_readback_restore_and_perm
                         assert data["previous_percent"] == expected
                         assert data["limit"]["percent"] == data["limit"]["active_percent"] == percent
                         assert data["changed"] is True
+                        assert data["configuration_verified"] is True
+                        assert data["active_readback_matches"] is True
                     stale = await session.call_tool(
                         "set_generation_limit", {"percent": 50, "expected_current_percent": 0}
                     )
@@ -278,6 +282,49 @@ def test_stdio_percentage_control_schema_precise_write_readback_restore_and_perm
         writes = [(address, value) for _, function, address, value in stub.requests if function != 3]
         assert writes == [(40125, 579), (40125, 0), (40125, 1000), (40125, 500)]
         assert all(unit == 1 and function in {3, 6} for unit, function, _, _ in stub.requests)
+
+    asyncio.run(check())
+
+
+def test_stdio_mixed_active_readback_reports_warning_and_restores_explicitly(tmp_path) -> None:
+    async def check() -> None:
+        stub = ModbusStub()
+        stub.allow_writes = True
+        stub.update_active_on_write = False
+        async with stub.serve() as port:
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "solar_mcp.server", "--inverter-host", "127.0.0.1", "--inverter-port", str(port)],
+                env={
+                    "SOLAR_EXPECTED_SERIAL": "TEST-INVERTER-0001",
+                    "SOLAR_INVERTER_UNIT_ID": "1",
+                    "SOLAR_ALLOW_CONTROL": "1",
+                    "SOLAR_CONTROL_LOG": str(tmp_path / "caps.jsonl"),
+                },
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    changed = await session.call_tool(
+                        "set_generation_limit",
+                        {"percent": 99, "expected_current_percent": 100, "expected_active_percent": 100},
+                    )
+                    assert not changed.is_error
+                    data = changed.structured_content
+                    assert data["configuration_verified"] is True
+                    assert data["active_readback_matches"] is False
+                    assert data["limit"]["percent"] == 99 and data["limit"]["active_percent"] == 100
+                    assert "output restriction is not confirmed" in data["warning"]
+                    restored = await session.call_tool(
+                        "set_generation_limit",
+                        {"percent": 100, "expected_current_percent": 99, "expected_active_percent": 100},
+                    )
+                    assert not restored.is_error
+                    assert restored.structured_content["active_readback_matches"] is True
+                    assert restored.structured_content["limit"]["percent"] == 100
+        assert [(address, word) for _, function, address, word in stub.requests if function == 6] == [
+            (40125, 990), (40125, 1000)
+        ]
 
     asyncio.run(check())
 
