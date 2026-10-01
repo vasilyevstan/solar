@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solar-mcp"
-version = "0.2.1"
-description = "Local Huawei inverter telemetry and opt-in generation caps over MCP"
+version = "0.3.0"
+description = "Huawei inverter telemetry, generation caps, and FusionSolar history over MCP"
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
@@ -14,11 +14,13 @@ dependencies = [
     "huawei-solar==3.0.7",
     "mcp==2.2.0",
     "pydantic==2.13.5",
+    "playwright==1.63.0",
     "tmodbus==0.6.2",
 ]
 
 [project.scripts]
 solar-mcp = "solar_mcp.server:main"
+solar-stats = "solar_stats.server:main"
 
 [project.urls]
 Repository = "https://github.com/vasilyevstan/solar"
@@ -27,7 +29,7 @@ Repository = "https://github.com/vasilyevstan/solar"
 dev = ["pytest>=8.4,<9"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/solar_mcp"]
+packages = ["src/solar_mcp", "src/solar_stats"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

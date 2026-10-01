@@ -1,4 +1,11 @@
-# solar-mcp
+# solar-mcp and solar-stats
+
+Two independent stdio MCP servers: **`solar-mcp`** connects locally to an inverter;
+**[`solar-stats`](#solar-stats-fusionsolar-history)** reads historical plant
+production from an authenticated FusionSolar browser session. The cloud-history
+server never connects to or controls the inverter.
+
+## solar-mcp: local inverter
 
 A local stdio [Model Context Protocol](https://modelcontextprotocol.io/) server for
 Huawei SUN2000 inverter telemetry, **read-only by default**, with optional
@@ -225,6 +232,123 @@ The repository ignores `*.jsonl` files.
 Do not run competing controllers, including simultaneous commissioning/cloud
 setting changes. Expected-value checking is not an atomic lock against other
 Modbus clients or FusionSolar; a later external change can override the result.
+
+## solar-stats: FusionSolar history
+
+`solar-stats` exposes one read-only tool:
+
+```text
+get_generation(start_date, end_date=None, format="json")
+```
+
+Dates use `YYYY-MM-DD`. Omitting the end date selects one day; a period is
+inclusive and may cross years. The default structured result includes:
+
+- `generation_kwh`: the requested period's sum, in **kWh**, not instantaneous kW.
+- `daily`: each requested date, its `generation_kwh`, and `source_missing`.
+- `missing_dates`, `source_complete`, source/plant identity, and UTC `retrieved_at`.
+- `date_basis: "plant_report_calendar"`: source daily labels are not shifted to UTC.
+
+The metric is **Plant Report / PV Yield (kWh)**, not inverter lifetime counters,
+household consumption, export, or revenue. Queries read FusionSolar each time;
+saved CSVs are exports, **never a default cache or fallback**.
+
+### Browser-session setup
+
+This version reuses a **dedicated, already signed-in Chrome session** through
+loopback remote debugging. Login/password storage and automatic password login
+are intentionally not implemented. Keep your configured plant open in the
+dedicated browser, and sign in again manually if the session expires. MFA and
+CAPTCHA are not bypassed.
+
+Do not use your normal browsing profile or expose its debugging port to the
+network. For example, on macOS, launch a separate Chrome window:
+
+```sh
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --user-data-dir=/absolute/private/path/solar-stats-browser \
+  --remote-debugging-port=0 --remote-debugging-address=127.0.0.1 \
+  "https://your-region.fusionsolar.huawei.com"
+```
+
+Sign in directly in that window and open your plant. Copy `.env.solar-stats.example` to the ignored
+`.env.solar-stats` and configure:
+
+| Setting | Meaning |
+|---|---|
+| `SOLAR_STATS_PLANT_URL` | Your authenticated plant page containing `/view/station/NE=...`; no query parameters, passwords, or tokens |
+| `SOLAR_STATS_PROFILE_DIR` | Absolute path to the dedicated running browser's private profile |
+| `SOLAR_STATS_TIMEOUT_SECONDS` | Whole-query deadline, including waiting for the shared profile; default 300 |
+
+Use a permission-restricted profile and configuration file. Authentication remains
+inside the browser: the server does not export cookies or collect passwords.
+Session expiry, missing report permissions, changed portal layouts, and rate
+limits are explicit errors. This uses the web reporting interface, **not** an
+official northbound/OpenAPI account.
+
+The adapter opens a native child tab from the authenticated plant page, retaining
+the browser's normal tab-scoped session without extracting it. It reads monthly reports and
+checks all reported pages, dates, units, and plant identity. A local profile lock
+serializes simultaneous `solar-stats` processes. It closes its own tab and
+connection, not the shared Chrome browser. Browser-session access currently
+requires macOS or Linux (`flock` support).
+
+### MCP and terminal use
+
+With no subcommand, this starts the stdio MCP:
+
+```sh
+uv run --no-sync --env-file .env.solar-stats solar-stats
+```
+
+For other MCP clients, use the same command with absolute project/configuration
+paths and enable only `get_generation`. This registration is independent of
+`solar-mcp`; it requires no inverter address or installer password.
+
+Terminal query mode prints raw JSON or CSV to stdout; diagnostics go to stderr:
+
+```sh
+uv run --no-sync --env-file .env.solar-stats solar-stats query \
+  --start-date 2025-01-01
+
+uv run --no-sync --env-file .env.solar-stats solar-stats query \
+  --start-date 2024-12-31 --end-date 2025-01-02
+
+uv run --no-sync --env-file .env.solar-stats solar-stats query \
+  --start-date 2025-01-01 --end-date 2025-12-31 --format csv \
+  --output state/solar-stats/generation-2025.csv
+```
+
+Use a separate query/output filename for 2024. `--output` writes the result
+instead of printing it. CSV output also creates a `.metadata.json` sidecar with
+the source, interval, missing dates, and CSV checksum. Keep both together: the
+checksum detects an interrupted export or subsequent edits. Existing CSVs are
+not modified if fetching fails.
+
+In MCP mode, `format="csv"` places CSV in the tool's text content and retains
+structured data/provenance. It does **not** print raw CSV into the MCP protocol.
+
+### Missing data and matrix interpretation
+
+Missing source readings for real requested dates are deliberately returned as
+**0**, with `source_missing: true`. A measured zero has `source_missing: false`.
+When any day is missing, `source_complete` is false and the total is a
+**sum with missing readings treated as zero**, not a verified total of all
+electricity actually produced. No interpolation or historical repair is done.
+
+Authentication errors, failed requests, incomplete pagination, invalid values,
+or wrong-period data are **not** converted to zero.
+
+The CSV columns are `year,month,1,2,...,31`. Rows follow chronological year/month
+order. A full year has January at the top and December at the bottom; partial
+and multi-year periods use only their intersecting months. Cells outside the
+requested period or on nonexistent dates remain blank. Thus 2024 has 366
+numeric date cells (including February 29) and six nonexistent-date blanks;
+2025 has 365 numeric date cells and seven blanks.
+
+Exports contain private plant data. The repository excludes `state/`, real
+`.env` files, and vendor documentation; never commit report data, profiles,
+cookies, or credentials.
 
 ## Development
 
