@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as BrowserError
-from playwright.async_api import Page, Response, async_playwright
+from playwright.async_api import BrowserContext, Page, Playwright, Response, async_playwright
 
+from .auth import keychain_credentials
 from .models import DateRange, GenerationReport, StatsError, make_report, parse_month_rows
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +45,9 @@ class StatsConfig:
     plant_url: str
     profile_dir: Path
     timeout_seconds: float = 300
+    browser_mode: Literal["attach", "managed"] = "attach"
+    headless: bool = True
+    keychain_service: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -56,6 +61,12 @@ class StatsConfig:
             raise StatsError("invalid_config", "SOLAR_STATS_PROFILE_DIR must be an absolute dedicated-profile path.")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise StatsError("invalid_config", "SOLAR_STATS_TIMEOUT_SECONDS must be finite and positive.")
+        if self.browser_mode not in {"attach", "managed"} or type(self.headless) is not bool:
+            raise StatsError("invalid_config", "Use browser mode attach/managed and headless true/false.")
+        if self.keychain_service is not None and (
+            not self.keychain_service.strip() or any(ord(char) < 32 for char in self.keychain_service)
+        ):
+            raise StatsError("invalid_config", "SOLAR_STATS_KEYCHAIN_SERVICE must be a nonempty Keychain item name.")
 
     @property
     def plant_id(self) -> str:
@@ -73,6 +84,19 @@ class StatsConfig:
             query=urlencode(routing), fragment=f"/view/station/{self.plant_id}/report"
         ))
 
+    def is_login_url(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        configured_host = urlsplit(self.plant_url).hostname or ""
+        login_host = re.sub(r"^uni\d+", "", configured_host)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname in {configured_host, login_host}
+            and parsed.port in {None, 443}
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == "/unisso/login.action"
+        )
+
     @classmethod
     def from_environment(cls) -> StatsConfig:
         url = os.environ.get("SOLAR_STATS_PLANT_URL", "")
@@ -83,7 +107,14 @@ class StatsConfig:
             timeout = float(os.environ.get("SOLAR_STATS_TIMEOUT_SECONDS", "300"))
         except ValueError as error:
             raise StatsError("invalid_config", "SOLAR_STATS_TIMEOUT_SECONDS must be a number.") from error
-        return cls(url, Path(profile).expanduser(), timeout)
+        mode = os.environ.get("SOLAR_STATS_BROWSER_MODE", "attach")
+        headless = os.environ.get("SOLAR_STATS_HEADLESS", "true")
+        if mode not in {"attach", "managed"} or headless not in {"true", "false"}:
+            raise StatsError("invalid_config", "Use browser mode attach/managed and headless true/false.")
+        return cls(
+            url, Path(profile).expanduser(), timeout, "attach" if mode == "attach" else "managed", headless == "true",
+            os.environ.get("SOLAR_STATS_KEYCHAIN_SERVICE"),
+        )
 
 
 @dataclass(frozen=True)
@@ -158,16 +189,22 @@ class FusionSolarSource:
 
     async def fetch(self, interval: DateRange) -> GenerationReport:
         try:
+            if self.config.keychain_service and (os.environ.get("DEBUG") or os.environ.get("PWDEBUG")):
+                raise StatsError("unsafe_debug_config", "Unset DEBUG and PWDEBUG before enabling credential-based login.")
             async with asyncio.timeout(self.config.timeout_seconds):
+                if self.config.browser_mode == "managed":
+                    self.config.profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if self.config.profile_dir.stat().st_mode & 0o077:
+                        raise StatsError("invalid_config", "The managed profile must be private (directory mode 0700).")
                 async with self._lock, profile_lock(self.config.profile_dir):
                     return await self._fetch(interval)
         except TimeoutError as error:
             raise StatsError("timeout", "The live query timed out; no cached or partial result was substituted.") from error
-        except BrowserError as error:
+        except BrowserError:
             raise StatsError(
                 "browser_session_unavailable",
-                "The report browser is unavailable or its interface changed. Reopen/sign in to the dedicated profile.",
-            ) from error
+                "The report browser is unavailable or its interface changed. Install Chrome or sign in to the dedicated profile.",
+            ) from None
         except OSError as error:
             raise StatsError("local_access_failed", f"Cannot access the browser session ({type(error).__name__}).") from error
 
@@ -175,33 +212,115 @@ class FusionSolarSource:
         if plant_from_url(page.url) != self.config.plant_id:
             raise StatsError("authentication_required", "The signed-in page is not the configured plant.")
 
-    async def _fetch(self, interval: DateRange) -> GenerationReport:
-        port = debugging_port(self.config.profile_dir)
-        async with async_playwright() as driver:
+    def _check_login_origin(self, page: Page) -> None:
+        if not self.config.is_login_url(page.url):
+            raise StatsError("unexpected_login_origin", "Refusing to enter credentials outside the configured login origin.")
+
+    @asynccontextmanager
+    async def _browser_context(self, driver: Playwright) -> AsyncIterator[BrowserContext]:
+        if self.config.browser_mode == "attach":
+            port = debugging_port(self.config.profile_dir)
             browser = await driver.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
             if not browser.contexts:
                 raise StatsError("authentication_required", "No authenticated browser context is available.")
-            seed = next(
-                (tab for tab in browser.contexts[0].pages if plant_from_url(tab.url) == self.config.plant_id), None
+            yield browser.contexts[0]
+        else:
+            context = await driver.chromium.launch_persistent_context(
+                str(self.config.profile_dir), channel="chrome", headless=self.config.headless,
+                timeout=20000, args=["--restore-last-session"],
             )
-            if seed is None:
+            try:
+                yield context
+            finally:
+                try:
+                    async with asyncio.timeout(5):
+                        await context.close()
+                except (BrowserError, TimeoutError):
+                    raise StatsError("browser_cleanup_failed", "The owned browser did not close cleanly.") from None
+
+    async def _portal_state(self, page: Page, *, after_login: bool = False) -> str:
+        result = await page.wait_for_function(
+            """afterLogin => {
+                const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
+                const report = document.querySelector('#timeDimension')?.closest('.dpdesign-select-selector');
+                if (visible(report)) return 'report';
+                const challenge = ['#twoFactorVerifyDiv', '#verifyCodeArea',
+                    'iframe[src*="captcha"]', '[id*="captcha" i]'];
+                if (challenge.some(selector => [...document.querySelectorAll(selector)].some(visible)))
+                    return 'challenge';
+                if (afterLogin) {
+                    const error = document.querySelector('#errorMessage');
+                    if (visible(error) && error.textContent.trim()) return 'rejected';
+                } else if (visible(document.querySelector('#username'))) return 'login';
+                return false;
+            }""",
+            arg=after_login, timeout=30000,
+        )
+        try:
+            state = await result.json_value()
+            if not isinstance(state, str) or state not in {"report", "login", "challenge", "rejected"}:
+                raise StatsError("portal_changed", "The browser returned an unrecognized authentication state.")
+            return state
+        finally:
+            await result.dispose()
+
+    async def _ensure_report(self, page: Page) -> None:
+        state = await self._portal_state(page)
+        if state == "report":
+            self._check_plant(page)
+            return
+        if state == "challenge":
+            raise StatsError("authentication_required", "Complete the FusionSolar MFA/CAPTCHA challenge manually.")
+        if not self.config.keychain_service:
+            raise StatsError("authentication_required", "Sign in to the dedicated browser or configure Keychain login.")
+        self._check_login_origin(page)
+        credentials = await keychain_credentials(self.config.keychain_service)
+        try:
+            self._check_login_origin(page)
+            await page.locator("#username").fill(credentials.username)
+            self._check_login_origin(page)
+            await page.locator("#value").fill(credentials.password)
+            self._check_login_origin(page)
+            await page.locator("#submitDataverify").click()
+            state = await self._portal_state(page, after_login=True)
+        except BrowserError:
+            raise StatsError(
+                "authentication_required",
+                "Login did not complete. Check credentials and any MFA/CAPTCHA challenge; no login retry was attempted.",
+            ) from None
+        finally:
+            del credentials
+        if state != "report":
+            raise StatsError(
+                "authentication_required",
+                "FusionSolar rejected login or requires an interactive challenge; no login retry was attempted.",
+            )
+        self._check_plant(page)
+
+    async def _fetch(self, interval: DateRange) -> GenerationReport:
+        async with async_playwright() as driver, self._browser_context(driver) as context:
+            seed = next(
+                (tab for tab in context.pages if plant_from_url(tab.url) == self.config.plant_id), None
+            )
+            if seed is None and self.config.browser_mode == "attach" and not self.config.keychain_service:
                 raise StatsError("authentication_required", "Open the configured plant in the signed-in dedicated browser.")
-            # Native new-tab navigation retains tab-scoped login state without reading or exporting it.
-            async with seed.expect_popup() as pending:
-                await seed.evaluate('(url) => { window.open(url, "_blank"); }', self.config.report_url(seed.url))
-            page = await pending.value
+            if self.config.browser_mode == "managed":
+                page = seed or (context.pages[0] if context.pages else await context.new_page())
+            elif seed is not None:
+                # Native new-tab navigation retains tab-scoped login state without reading or exporting it.
+                async with seed.expect_popup() as pending:
+                    await seed.evaluate('(url) => { window.open(url, "_blank"); }', self.config.report_url(seed.url))
+                page = await pending.value
+            else:
+                page = await context.new_page()
             page.set_default_timeout(15000)
             try:
-                await page.wait_for_load_state("domcontentloaded")
-                selector = page.locator(".dpdesign-select-selector").filter(has=page.locator("#timeDimension"))
-                try:
-                    await selector.wait_for(state="visible")
-                except BrowserError as error:
-                    raise StatsError(
-                        "authentication_required",
-                        "The Plant Report is not available. Sign in normally; MFA and CAPTCHA cannot be bypassed.",
-                    ) from error
-                self._check_plant(page)
+                if seed is None or self.config.browser_mode == "managed":
+                    target = self.config.report_url(seed.url) if seed is not None else self.config.plant_url
+                    await page.goto(target, wait_until="domcontentloaded")
+                else:
+                    await page.wait_for_load_state("domcontentloaded")
+                await self._ensure_report(page)
                 await self._granularity(page, "By day")
                 today = DateRange.parse(await page.get_by_placeholder("Select date", exact=True).input_value()).start
                 interval.check_not_future(today)
@@ -221,8 +340,9 @@ class FusionSolarSource:
                 return make_report(interval, self.config.plant_id, months)
             finally:
                 try:
-                    async with asyncio.timeout(5):
-                        await page.close()
+                    if self.config.browser_mode == "attach":
+                        async with asyncio.timeout(5):
+                            await page.close()
                 except (BrowserError, TimeoutError):
                     LOGGER.warning("Could not close the owned report tab; the shared browser was not terminated.")
 

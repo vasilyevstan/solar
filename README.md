@@ -255,14 +255,15 @@ saved CSVs are exports, **never a default cache or fallback**.
 
 ### Browser-session setup
 
-This version reuses a **dedicated, already signed-in Chrome session** through
-loopback remote debugging. Login/password storage and automatic password login
-are intentionally not implemented. Keep your configured plant open in the
-dedicated browser, and sign in again manually if the session expires. MFA and
-CAPTCHA are not bypassed.
+Two browser modes are available. The default **`attach`** mode preserves existing
+behavior: reuse a dedicated, signed-in Chrome session through loopback remote
+debugging. **`managed`** mode starts installed Google Chrome automatically, with
+a persistent private profile, and closes only that owned browser after the query.
+Managed mode is headless by default and does not expose a debugging port.
 
-Do not use your normal browsing profile or expose its debugging port to the
-network. For example, on macOS, launch a separate Chrome window:
+Do not use your normal browsing profile. For `attach` mode, keep your configured
+plant open and do not expose its debugging port to the network. For example, on
+macOS, launch a separate Chrome window:
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -277,21 +278,64 @@ Sign in directly in that window and open your plant. Copy `.env.solar-stats.exam
 | Setting | Meaning |
 |---|---|
 | `SOLAR_STATS_PLANT_URL` | Your authenticated plant page containing `/view/station/NE=...`; no query parameters, passwords, or tokens |
-| `SOLAR_STATS_PROFILE_DIR` | Absolute path to the dedicated running browser's private profile |
+| `SOLAR_STATS_PROFILE_DIR` | Absolute dedicated profile path; managed mode creates it privately and requires directory mode `0700` |
 | `SOLAR_STATS_TIMEOUT_SECONDS` | Whole-query deadline, including waiting for the shared profile; default 300 |
+| `SOLAR_STATS_BROWSER_MODE` | `attach` (default) or `managed`; never run both modes against the same profile concurrently |
+| `SOLAR_STATS_HEADLESS` | `true` (default) or `false`, used by managed mode |
+| `SOLAR_STATS_KEYCHAIN_SERVICE` | Optional macOS generic-password item name for automatic login; unset by default |
 
-Use a permission-restricted profile and configuration file. Authentication remains
-inside the browser: the server does not export cookies or collect passwords.
-Session expiry, missing report permissions, changed portal layouts, and rate
-limits are explicit errors. This uses the web reporting interface, **not** an
-official northbound/OpenAPI account.
+For automatic startup, set `SOLAR_STATS_BROWSER_MODE=managed` and use a separate
+private profile on persistent storage. Chrome must already be installed; no
+browser download, desktop, scheduler, or background service is required.
+macOS and Linux browser sessions are supported (`flock` is required); the optional
+credential reader described below is macOS-only.
+
+Treat the profile as sensitive: it retains normal browser session credentials.
+The server does not export cookies or copy another browser's authentication
+storage. Missing permissions, changed portal layouts, and rate limits remain
+explicit errors. This is a web-report integration, **not** an official
+northbound/OpenAPI account.
 
 The adapter opens a native child tab from the authenticated plant page, retaining
 the browser's normal tab-scoped session without extracting it. It reads monthly reports and
 checks all reported pages, dates, units, and plant identity. A local profile lock
-serializes simultaneous `solar-stats` processes. It closes its own tab and
-connection, not the shared Chrome browser. Browser-session access currently
-requires macOS or Linux (`flock` support).
+serializes simultaneous `solar-stats` processes. Attach mode closes only its own
+tab and connection, never the shared Chrome browser. Managed mode restores its
+own profile's last session before attempting login.
+
+### Optional macOS Keychain login
+
+In **Keychain Access**, select the **login** keychain and create a new password
+item named `solar-stats.fusionsolar`. Its account name is your FusionSolar
+username/email; its password is your FusionSolar password. Enter both directly
+in Keychain Access, not in chat, shell arguments, environment variables, or Git.
+Configure only this reference:
+
+```dotenv
+SOLAR_STATS_KEYCHAIN_SERVICE=solar-stats.fusionsolar
+```
+
+The reader uses the native `/usr/bin/security` helper. Authorize that application
+for this specific item through Keychain Access when prompted; do **not** allow
+all applications. That authorization trusts the helper executable, not just this
+Python project. The login Keychain must be accessible to the signed-in macOS
+account. No new Python credential dependency or plaintext fallback is used.
+
+Queries reuse an authenticated session first. Only a recognized login page on
+the configured FusionSolar region triggers a Keychain read and one login attempt.
+The username/password stay in local process memory and the browser login form;
+the helper's output is captured privately, never returned through MCP or logs.
+`DEBUG`/`PWDEBUG` must be unset when Keychain login is enabled to avoid browser
+diagnostics exposing form values.
+
+Keychain access is bounded; denial, a locked Keychain, rejected credentials,
+MFA, and CAPTCHA are explicit errors, not zero generation. There are no automatic
+login retries. Resolve an authentication error before repeating queries. For an
+interactive challenge, stop managed queries, open that profile manually with
+the Chrome command above, and sign in normally. Close that manual browser before
+resuming managed queries. Challenges are never bypassed. Without the Keychain
+option, sign in manually and reuse the profile. Headless Linux credential
+provisioning is not implemented by this macOS integration.
 
 ### MCP and terminal use
 
@@ -319,7 +363,8 @@ uv run --no-sync --env-file .env.solar-stats solar-stats query \
   --output state/solar-stats/generation-2025.csv
 ```
 
-Use a separate query/output filename for 2024. `--output` writes the result
+Use a separate query/output filename for each year, including 2023 or 2024.
+`--output` writes the result
 instead of printing it. CSV output also creates a `.metadata.json` sidecar with
 the source, interval, missing dates, and CSV checksum. Keep both together: the
 checksum detects an interrupted export or subsequent edits. Existing CSVs are

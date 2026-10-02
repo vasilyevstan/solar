@@ -116,7 +116,7 @@ def test_failed_months_are_not_silently_filled() -> None:
         make_report(DateRange.parse("2025-01-01"), "NE=123456", {(2025, 1): {date(2025, 1, 1): Decimal("-1")}})
 
 
-@pytest.mark.parametrize("year,count,blanks", [(2024, 366, 6), (2025, 365, 7)])
+@pytest.mark.parametrize("year,count,blanks", [(2023, 365, 7), (2024, 366, 6), (2025, 365, 7)])
 def test_full_year_csv_shape_and_separate_exports(tmp_path, year, count, blanks) -> None:
     report = synthetic_report(DateRange.parse(f"{year}-01-01", f"{year}-12-31"), missing=True)
     path = tmp_path / f"generation-{year}.csv"
@@ -216,6 +216,7 @@ def test_query_opens_native_child_tab_and_closes_only_its_own_page(tmp_path, mon
         manager.__aenter__.return_value = driver
         monkeypatch.setattr("solar_stats.browser.async_playwright", lambda: manager)
         monkeypatch.setattr("solar_stats.browser.debugging_port", lambda _: 12345)
+        monkeypatch.setattr(source, "_ensure_report", AsyncMock())
         monkeypatch.setattr(source, "_granularity", AsyncMock(side_effect=StatsError("probe_complete", "Tab is ready.")))
         with pytest.raises(StatsError, match="probe_complete"):
             await source._fetch(DateRange.parse("2025-01-01"))

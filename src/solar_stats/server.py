@@ -31,7 +31,7 @@ def create_server(source: GenerationSource) -> MCPServer[None]:
             "Read-only whole-plant PV generation history in kWh, not instantaneous kW or grid export. "
             "Every query reads FusionSolar, not a local CSV cache. Source-missing dates are zero-filled "
             "but identified in metadata; never describe incomplete totals as all actual production. "
-            "Dates follow the plant report calendar. No inverter controls or password handling."
+            "Dates follow the plant report calendar. No inverter controls or credential tool arguments/results."
         ),
     )
 
