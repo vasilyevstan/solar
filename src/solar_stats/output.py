@@ -8,18 +8,15 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from .models import DateRange, GenerationReport, StatsError, report_from_days
+from .models import MONTH_NAMES, DateRange, GenerationReport, StatsError, report_from_days
+from .stored import read_saved_year, saved_data_lock
 
 OutputFormat = Literal["json", "csv"]
-MONTH_NAMES = (
-    "", "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
 
 
 def csv_matrix(report: GenerationReport) -> str:
@@ -69,16 +66,15 @@ def _stage_file(path: Path, content: str) -> Path:
         raise
 
 
-def save_report(report: GenerationReport, output_format: OutputFormat, path: Path) -> None:
+def save_contents_unlocked(content: str, sidecar_data: dict[str, object] | None, path: Path) -> None:
     staged: list[Path] = []
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        content = render(report, output_format)
         data_file = _stage_file(path, content)
         staged.append(data_file)
-        if output_format == "csv":
+        if sidecar_data is not None:
             sidecar = path.with_suffix(".metadata.json")
-            meta_file = _stage_file(sidecar, json.dumps(metadata(report, content), indent=2) + "\n")
+            meta_file = _stage_file(sidecar, json.dumps(sidecar_data, indent=2) + "\n")
             staged.append(meta_file)
             # Readers reject a mismatched pair if publication is interrupted between the two replacements.
             os.replace(meta_file, sidecar)
@@ -90,14 +86,51 @@ def save_report(report: GenerationReport, output_format: OutputFormat, path: Pat
             temporary.unlink(missing_ok=True)
 
 
+def _save_report_unlocked(report: GenerationReport, output_format: OutputFormat, path: Path) -> None:
+    content = render(report, output_format)
+    save_contents_unlocked(content, metadata(report, content) if output_format == "csv" else None, path)
+
+
+def save_report(report: GenerationReport, output_format: OutputFormat, path: Path) -> None:
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with saved_data_lock(path.parent, exclusive=True):
+            _save_report_unlocked(report, output_format, path)
+    except OSError as error:
+        raise StatsError("export_failed", f"Could not finish saving the export ({type(error).__name__}).") from error
+
+
 def save_yearly_reports(report: GenerationReport, directory: Path) -> list[Path]:
     interval = DateRange.parse(report.start_date, report.end_date)
     readings = {date.fromisoformat(day.date): day for day in report.daily}
     paths = []
-    for year in range(interval.start.year, interval.end.year + 1):
-        period = DateRange(max(interval.start, date(year, 1, 1)), min(interval.end, date(year, 12, 31)))
-        yearly = report_from_days(period, report.plant_id, readings)
-        path = directory / f"generation-{year}.csv"
-        save_report(yearly, "csv", path)
-        paths.append(path)
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with saved_data_lock(directory, exclusive=True):
+            for year in range(interval.start.year, interval.end.year + 1):
+                path = directory / f"generation-{year}.csv"
+                previous = (
+                    read_saved_year(path, report.plant_id, year)
+                    if path.exists() or path.with_suffix(".metadata.json").exists() else {}
+                )
+                for day, item in readings.items():
+                    if day.year != year:
+                        continue
+                    existing = previous.get(day)
+                    if existing is not None and not existing.source_missing:
+                        if item.source_missing:
+                            continue
+                        old_time = datetime.fromisoformat(existing.source_retrieved_at or report.retrieved_at)
+                        new_time = datetime.fromisoformat(item.source_retrieved_at or report.retrieved_at)
+                        if new_time < old_time:
+                            continue
+                    previous[day] = item
+                period = DateRange(min(previous), max(previous))
+                if set(previous) != set(period.dates()):
+                    raise StatsError("incomplete_export", "Yearly appends need contiguous coverage; fetch the intervening dates first.")
+                yearly = report_from_days(period, report.plant_id, previous)
+                _save_report_unlocked(yearly, "csv", path)
+                paths.append(path)
+    except OSError as error:
+        raise StatsError("export_failed", f"Could not finish saving yearly exports ({type(error).__name__}).") from error
     return paths

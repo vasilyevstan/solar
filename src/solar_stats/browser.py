@@ -9,7 +9,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -20,6 +20,7 @@ from playwright.async_api import TimeoutError as BrowserTimeoutError
 from playwright.async_api import BrowserContext, Page, Playwright, Request, async_playwright
 
 from .auth import keychain_credentials
+from .hourly import HourlyDay, HourlyReport, hour_slots, hourly_days_from_values, make_hourly_report, parse_hourly_rows, report_zone
 from .models import DateRange, GenerationReport, StatsError, make_report, parse_month_rows
 
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class StatsConfig:
     headless: bool = True
     keychain_service: str | None = None
     data_dir: Path = field(default_factory=lambda: Path("state/solar-stats").resolve())
+    time_zone: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -63,6 +65,8 @@ class StatsConfig:
             raise StatsError("invalid_config", "SOLAR_STATS_PROFILE_DIR must be an absolute dedicated-profile path.")
         if not self.data_dir.is_absolute():
             raise StatsError("invalid_config", "SOLAR_STATS_DATA_DIR must be an absolute directory path.")
+        if self.time_zone is not None:
+            report_zone(self.time_zone)
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise StatsError("invalid_config", "SOLAR_STATS_TIMEOUT_SECONDS must be finite and positive.")
         if self.browser_mode not in {"attach", "managed"} or type(self.headless) is not bool:
@@ -115,6 +119,23 @@ class StatsConfig:
         host = re.sub(r"^uni\d+", "", urlsplit(self.plant_url).hostname or "")
         return urlunsplit(("https", host, "/unisso/login.action", "", f"/view/station/{self.plant_id}/report"))
 
+    def is_application_page(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        configured = urlsplit(self.plant_url)
+        return (
+            parsed.scheme == "https" and parsed.hostname == configured.hostname
+            and parsed.port in {None, 443} and parsed.username is None and parsed.password is None
+            and parsed.path in {configured.path, "/uniportal/portal"}
+        )
+
+    def application_report_url(self, url: str) -> str:
+        if not self.is_application_page(url):
+            raise StatsError("unexpected_login_origin", "The application landing is outside the configured origin.")
+        parsed = urlsplit(url)
+        configured = urlsplit(self.plant_url)
+        routing = urlencode([(key, value) for key, value in parse_qsl(parsed.query) if key in {"app-id", "instance-id", "zone-id"}])
+        return urlunsplit(configured._replace(query=routing, fragment=f"/view/station/{self.plant_id}/report"))
+
     @classmethod
     def from_environment(cls) -> StatsConfig:
         url = os.environ.get("SOLAR_STATS_PLANT_URL", "")
@@ -133,6 +154,7 @@ class StatsConfig:
             url, Path(profile).expanduser(), timeout, "attach" if mode == "attach" else "managed", headless == "true",
             os.environ.get("SOLAR_STATS_KEYCHAIN_SERVICE"),
             Path(os.environ.get("SOLAR_STATS_DATA_DIR", "state/solar-stats")).expanduser().resolve(),
+            os.environ.get("SOLAR_STATS_TIMEZONE"),
         )
 
 
@@ -207,6 +229,14 @@ class FusionSolarSource:
         self._lock = asyncio.Lock()
 
     async def fetch(self, interval: DateRange) -> GenerationReport:
+        return await self._run(lambda: self._fetch(interval))
+
+    async def fetch_hourly(self, interval: DateRange) -> HourlyReport:
+        if not self.config.time_zone:
+            raise StatsError("invalid_config", "Set SOLAR_STATS_TIMEZONE before querying hourly history.")
+        return await self._run(lambda: self._fetch_hourly(interval))
+
+    async def _run[T](self, operation: Callable[[], Awaitable[T]]) -> T:
         try:
             if self.config.keychain_service and (os.environ.get("DEBUG") or os.environ.get("PWDEBUG")):
                 raise StatsError("unsafe_debug_config", "Unset DEBUG and PWDEBUG before enabling credential-based login.")
@@ -216,7 +246,7 @@ class FusionSolarSource:
                     if self.config.profile_dir.stat().st_mode & 0o077:
                         raise StatsError("invalid_config", "The managed profile must be private (directory mode 0700).")
                 async with self._lock, profile_lock(self.config.profile_dir):
-                    return await self._fetch(interval)
+                    return await operation()
         except TimeoutError as error:
             raise StatsError("timeout", "The live query timed out; no cached or partial result was substituted.") from error
         except BrowserError:
@@ -263,6 +293,10 @@ class FusionSolarSource:
                 const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
                 const report = document.querySelector('#timeDimension')?.closest('.dpdesign-select-selector');
                 if (visible(report)) return 'report';
+                if (location.pathname === '/uniportal/portal' && document.body.innerText.trim())
+                    return 'application';
+                if (location.hash.startsWith('#/home/') && document.body.innerText.trim())
+                    return 'application';
                 const challenge = ['#twoFactorVerifyDiv', '#verifyCodeArea',
                     'iframe[src*="captcha"]', '[id*="captcha" i]'];
                 if (challenge.some(selector => [...document.querySelectorAll(selector)].some(visible)))
@@ -277,7 +311,7 @@ class FusionSolarSource:
         )
         try:
             state = await result.json_value()
-            if not isinstance(state, str) or state not in {"report", "login", "challenge", "rejected"}:
+            if not isinstance(state, str) or state not in {"report", "application", "login", "challenge", "rejected"}:
                 raise StatsError("portal_changed", "The browser returned an unrecognized authentication state.")
             return state
         finally:
@@ -312,11 +346,16 @@ class FusionSolarSource:
             LOGGER.warning("The restored portal tab is blank; reopening the normal regional sign-in page once.")
             await page.goto(self.config.login_url, wait_until="domcontentloaded")
             state = await self._portal_state(page)
+        if state == "application":
+            await page.goto(self.config.application_report_url(page.url), wait_until="domcontentloaded")
+            state = await self._portal_state(page)
         if state == "report":
             self._check_plant(page)
             return page
         if state == "challenge":
             raise StatsError("authentication_required", "Complete the FusionSolar MFA/CAPTCHA challenge manually.")
+        if state != "login":
+            raise StatsError("authentication_required", "The configured plant report is not available from this application.")
         if not self.config.keychain_service:
             raise StatsError("authentication_required", "Sign in to the dedicated browser or configure Keychain login.")
         self._check_login_origin(page)
@@ -339,6 +378,9 @@ class FusionSolarSource:
             self._check_login_origin(page)
             await page.locator("#submitDataverify").click()
             destination, state = await self._login_destination(page, popup)
+            if state == "application":
+                await destination.goto(self.config.application_report_url(destination.url), wait_until="domcontentloaded")
+                state = await self._portal_state(destination)
             if state != "report":
                 raise StatsError(
                     "authentication_required",
@@ -364,11 +406,16 @@ class FusionSolarSource:
                     except (BrowserError, TimeoutError):
                         LOGGER.warning("Could not close an owned login popup.")
 
-    async def _fetch(self, interval: DateRange) -> GenerationReport:
+    @asynccontextmanager
+    async def _report_page(self) -> AsyncIterator[Page]:
         async with async_playwright() as driver, self._browser_context(driver) as context:
             seed = next(
-                (tab for tab in context.pages if self.config.is_plant_page(tab.url)), None
+                (tab for tab in reversed(context.pages) if self.config.is_plant_page(tab.url)), None
             )
+            if seed is None:
+                seed = next(
+                    (tab for tab in reversed(context.pages) if self.config.is_application_page(tab.url)), None
+                )
             if seed is None and self.config.browser_mode == "attach" and not self.config.keychain_service:
                 raise StatsError("authentication_required", "Open the configured plant in the signed-in dedicated browser.")
             if self.config.browser_mode == "managed":
@@ -376,14 +423,14 @@ class FusionSolarSource:
             elif seed is not None:
                 # Native new-tab navigation retains tab-scoped login state without reading or exporting it.
                 async with seed.expect_popup() as pending:
-                    await seed.evaluate('(url) => { window.open(url, "_blank"); }', self.config.report_url(seed.url))
+                    await seed.evaluate('(url) => { window.open(url, "_blank"); }', self.config.application_report_url(seed.url))
                 page = await pending.value
             else:
                 page = await context.new_page()
             page.set_default_timeout(15000)
             try:
                 if seed is None or self.config.browser_mode == "managed":
-                    target = self.config.report_url(seed.url) if seed is not None else self.config.plant_url
+                    target = self.config.application_report_url(seed.url) if seed is not None else self.config.plant_url
                     await page.goto(target, wait_until="domcontentloaded")
                 else:
                     await page.wait_for_load_state("domcontentloaded")
@@ -391,23 +438,7 @@ class FusionSolarSource:
                 page = await self._ensure_report(page)
                 if page is not original:
                     await original.close()
-                await self._granularity(page, "By day")
-                today = DateRange.parse(await page.get_by_placeholder("Select date", exact=True).input_value()).start
-                interval.check_not_future(today)
-                await self._granularity(page, "By month")
-                await page.get_by_placeholder("Select month", exact=True).wait_for(state="visible")
-                size_selector = page.locator(".dpdesign-select-selector").filter(
-                    has=page.get_by_role("combobox", name="Page Size")
-                )
-                await size_selector.wait_for(state="visible")
-                if "100 / page" not in await size_selector.inner_text():
-                    await size_selector.click()
-                    await self._request(page, lambda: page.get_by_text("100 / page", exact=True).click())
-                months: dict[tuple[int, int], dict[date, Decimal | None]] = {}
-                for year, month in interval.months():
-                    months[(year, month)] = await self._month(page, year, month)
-                self._check_plant(page)
-                return make_report(interval, self.config.plant_id, months)
+                yield page
             finally:
                 try:
                     if self.config.browser_mode == "attach":
@@ -415,6 +446,161 @@ class FusionSolarSource:
                             await page.close()
                 except (BrowserError, TimeoutError):
                     LOGGER.warning("Could not close the owned report tab; the shared browser was not terminated.")
+
+    async def _fetch(self, interval: DateRange) -> GenerationReport:
+        async with self._report_page() as page:
+            await self._granularity(page, "By day")
+            today = DateRange.parse(await page.get_by_placeholder("Select date", exact=True).input_value()).start
+            interval.check_not_future(today)
+            await self._granularity(page, "By month")
+            await page.get_by_placeholder("Select month", exact=True).wait_for(state="visible")
+            size_selector = page.locator(".dpdesign-select-selector").filter(
+                has=page.get_by_role("combobox", name="Page Size")
+            )
+            await size_selector.wait_for(state="visible")
+            if "100 / page" not in await size_selector.inner_text():
+                await size_selector.click()
+                await self._request(page, lambda: page.get_by_text("100 / page", exact=True).click())
+            months: dict[tuple[int, int], dict[date, Decimal | None]] = {}
+            for year, month in interval.months():
+                months[(year, month)] = await self._month(page, year, month)
+            self._check_plant(page)
+            return make_report(interval, self.config.plant_id, months)
+
+    async def _select_calendar_date(self, page: Page, day: date) -> None:
+        await page.locator(".dpdesign-picker-year-btn:visible").first.click()
+        cell = page.locator(f'.dpdesign-picker-cell[title="{day.year}"]:visible').first
+        for _ in range(1000):
+            if await cell.count():
+                break
+            visible_years = await page.locator(".dpdesign-picker-cell[title]:visible").evaluate_all(
+                "nodes => nodes.map(n => n.title).filter(t => /^\\d{4}$/.test(t)).map(Number)"
+            )
+            if not visible_years:
+                raise StatsError("portal_changed", "The hourly year picker has no selectable year labels.")
+            direction = "prev" if day.year < min(visible_years) else "next"
+            await page.locator(f".dpdesign-picker-header-super-{direction}-btn:visible").first.click()
+        if not await cell.count() or "disabled" in (await cell.get_attribute("class") or ""):
+            raise StatsError("unavailable_period", "The hourly date is disabled in the portal.")
+        await cell.click()
+        month = page.locator(f'.dpdesign-picker-cell[title="{day.year}-{day.month:02}"]:visible').first
+        if not await month.count():
+            await page.locator(".dpdesign-picker-month-btn:visible").first.click()
+        await month.click()
+        day_cell = page.locator(f'.dpdesign-picker-cell[title="{day.isoformat()}"]:visible').first
+        if "disabled" in (await day_cell.get_attribute("class") or ""):
+            raise StatsError("unavailable_period", "The requested hourly day is disabled in the portal.")
+        await day_cell.click()
+
+    async def _hourly_range(self, page: Page, interval: DateRange) -> dict[date, HourlyDay]:
+        time_zone = self.config.time_zone
+        if time_zone is None:
+            raise StatsError("invalid_config", "Hourly reports need a configured report time zone.")
+        start = page.get_by_placeholder("Start date", exact=True)
+        end = page.get_by_placeholder("End date", exact=True)
+        await page.locator(".dpdesign-picker").filter(has=start).hover()
+        clear = page.locator(".dpdesign-picker-clear:visible")
+        if await clear.count():
+            await clear.first.click()
+        await start.click()
+        await self._select_calendar_date(page, interval.start)
+        last = page.locator(f'.dpdesign-picker-cell[title="{interval.end.isoformat()}"]:visible').first
+        if await last.count():
+            await last.click()
+        else:
+            await end.click()
+            await self._select_calendar_date(page, interval.end)
+        if (await start.input_value(), await end.input_value()) != (interval.start.isoformat(), interval.end.isoformat()):
+            raise StatsError("wrong_period", "The hourly date range was not committed by the portal.")
+        page_number = 1
+        total = size = None
+        values: dict[str, Decimal | None] = {}
+        action = lambda: page.get_by_text("Search", exact=True).click()
+        while True:
+            current = await self._hourly_request(page, action, interval, page_number)
+            if total is None:
+                total, size = current.total, current.size
+                maximum = sum(len(hour_slots(day, time_zone)) for day in interval.dates())
+                if total > maximum:
+                    raise StatsError("wrong_period", "The hourly report has more rows than real clock hours.")
+            if current.total != total or current.size != size or current.number != page_number:
+                raise StatsError("incomplete_source", "Hourly pagination changed or skipped a page.")
+            parsed = parse_hourly_rows(*(await self._table(page, current.dates)), interval, time_zone)
+            if values.keys() & parsed.keys():
+                raise StatsError("incomplete_source", "An hourly page was repeated.")
+            values.update(parsed)
+            if len(values) == total:
+                return hourly_days_from_values(interval, time_zone, values)
+            next_page = page.locator(".dpdesign-pagination-next")
+            if await next_page.get_attribute("aria-disabled") == "true":
+                raise StatsError("incomplete_source", "The hourly report ended before all rows were read.")
+            page_number += 1
+            action = next_page.click
+
+    async def _hourly_request(
+        self, page: Page, action: Callable[[], Awaitable[None]], interval: DateRange, number: int
+    ) -> ReportPage:
+        zone = report_zone(self.config.time_zone or "")
+        start = int(datetime.combine(interval.start, time.min, zone).timestamp() * 1000)
+        def matches(request: Request) -> bool:
+            parsed = urlsplit(request.url)
+            if (
+                parsed.scheme != "https" or parsed.hostname != urlsplit(self.config.plant_url).hostname
+                or parsed.path != REPORT_PATH
+            ):
+                return False
+            body = request.post_data_json
+            return (
+                isinstance(body, dict) and str(body.get("statDim")) == "2"
+                and body.get("statTime") == start and body.get("page") == number
+            )
+        async with page.expect_request(matches) as pending:
+            await action()
+        request = await pending.value
+        body = request.post_data_json
+        expected_end = int(datetime.combine(interval.end, time.min, zone).timestamp() * 1000)
+        if body.get("timeZoneStr") != self.config.time_zone or body.get("statEndTime") != expected_end:
+            raise StatsError("wrong_period", "The hourly request uses a different report time zone or end date.")
+        response = await request.response()
+        self._check_plant(page)
+        if response is None or response.status != 200:
+            status = response.status if response else None
+            code = "rate_limited" if status == 429 else "authentication_required" if status in {401, 403} else "source_unavailable"
+            raise StatsError(code, f"The hourly report request failed (HTTP {status}).")
+        try:
+            payload = await response.json()
+        except ValueError:
+            raise StatsError("portal_changed", "The hourly response was not JSON.") from None
+        if isinstance(payload, dict) and payload.get("success") is not True:
+            raise StatsError(
+                "hourly_report_unavailable",
+                f"FusionSolar did not return a successful hourly report for {interval.start} through {interval.end}; "
+                "no zero production was substituted.",
+            )
+        return validate_report_page(payload)
+
+    async def _fetch_hourly(self, interval: DateRange) -> HourlyReport:
+        async with self._report_page() as page:
+            await self._granularity(page, "By day")
+            today = DateRange.parse(await page.get_by_placeholder("Select date", exact=True).input_value()).start
+            interval.check_not_future(today)
+            if interval.end == today:
+                raise StatsError("invalid_request", "Hourly reports require completed plant-calendar days.")
+            await self._granularity(page, "By time range")
+            await page.locator("#checkHourDim").check()
+            size_selector = page.locator(".dpdesign-select-selector").filter(
+                has=page.get_by_role("combobox", name="Page Size")
+            )
+            if "100 / page" not in await size_selector.inner_text():
+                await size_selector.click()
+                await page.get_by_text("100 / page", exact=True).click()
+            days: dict[date, HourlyDay] = {}
+            first = interval.start
+            while first <= interval.end:
+                end = min(first + timedelta(days=30), interval.end)
+                days.update(await self._hourly_range(page, DateRange(first, end)))
+                first = end + timedelta(days=1)
+            return make_hourly_report(interval, self.config.plant_id, self.config.time_zone or "", days)
 
     async def _granularity(self, page: Page, value: str) -> None:
         selector = page.locator(".dpdesign-select-selector").filter(has=page.locator("#timeDimension"))

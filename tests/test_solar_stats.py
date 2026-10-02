@@ -158,7 +158,7 @@ def test_export_failure_does_not_replace_previous_data(tmp_path, monkeypatch) ->
     with pytest.raises(StatsError, match="export_failed"):
         save_report(report, "csv", path)
     assert path.read_text() == "previous dataset\n"
-    assert list(tmp_path.iterdir()) == [path]
+    assert set(tmp_path.iterdir()) == {path, tmp_path / ".solar-stats-exports.lock"}
 
 
 @pytest.mark.parametrize(
@@ -349,7 +349,7 @@ def test_real_stdio_discovery_does_not_need_browser_and_no_modbus_import(tmp_pat
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                assert [tool.name for tool in (await session.list_tools()).tools] == ["get_generation"]
+                assert [tool.name for tool in (await session.list_tools()).tools] == ["get_generation", "get_hourly_generation"]
                 result = await session.call_tool("get_generation", {"start_date": "2025-01-01"})
                 assert result.is_error and "authentication_required" in str(result.content)
     asyncio.run(check())

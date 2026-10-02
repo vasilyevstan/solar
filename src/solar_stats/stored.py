@@ -3,21 +3,43 @@ from __future__ import annotations
 import asyncio
 import calendar
 import csv
+import fcntl
 import hashlib
 import io
 import json
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
-from .models import DateRange, GenerationDay, GenerationReport, StatsError, parse_kwh, report_from_days
-from .output import MONTH_NAMES
+from .models import MONTH_NAMES, DateRange, GenerationDay, GenerationReport, StatsError, parse_kwh, report_from_days
 
 
 class PortalSource(Protocol):
     async def fetch(self, interval: DateRange) -> GenerationReport: ...
+
+
+@contextmanager
+def saved_data_lock(directory: Path, *, exclusive: bool = False) -> Iterator[None]:
+    path = directory / ".solar-stats-exports.lock"
+    flags = os.O_RDWR | os.O_CREAT if exclusive else os.O_RDONLY
+    try:
+        descriptor = os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    except FileNotFoundError:
+        if exclusive:
+            raise
+        yield
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _timestamp(value: object) -> str:
@@ -105,7 +127,8 @@ def read_saved_year(path: Path, plant_id: str, year: int) -> dict[date, Generati
 
 def load_saved_days(directory: Path, plant_id: str, interval: DateRange) -> dict[date, GenerationDay]:
     try:
-        return _load_saved_days(directory, plant_id, interval)
+        with saved_data_lock(directory):
+            return _load_saved_days(directory, plant_id, interval)
     except OSError as error:
         raise StatsError("saved_data_unavailable", f"Cannot read the saved-data directory ({type(error).__name__}).") from None
 

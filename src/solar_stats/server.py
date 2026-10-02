@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from collections.abc import Sequence
@@ -15,9 +16,10 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
 from .browser import FusionSolarSource, StatsConfig
+from .hourly import HourlyReport, StoredHourlySource, hourly_csv, hourly_metadata, save_hourly_years
 from .models import DateRange, GenerationReport, StatsError
-from .output import OutputFormat, render, save_report, save_yearly_reports
-from .stored import StoredGenerationSource
+from .output import OutputFormat, render, save_contents_unlocked, save_report, save_yearly_reports
+from .stored import StoredGenerationSource, saved_data_lock
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,7 +28,11 @@ class GenerationSource(Protocol):
     async def fetch(self, interval: DateRange, *, refresh: bool = False) -> GenerationReport: ...
 
 
-def create_server(source: GenerationSource) -> MCPServer[None]:
+class HourlySource(Protocol):
+    async def fetch(self, interval: DateRange, *, refresh: bool = False) -> HourlyReport: ...
+
+
+def create_server(source: GenerationSource, hourly_source: HourlySource | None = None) -> MCPServer[None]:
     server = MCPServer(
         "solar-stats",
         instructions=(
@@ -35,6 +41,8 @@ def create_server(source: GenerationSource) -> MCPServer[None]:
             "refresh=true forces a live query. Source-missing dates are zero-filled "
             "but identified in metadata; never describe incomplete totals as all actual production. "
             "Dates follow the plant report calendar. No inverter controls or credential tool arguments/results."
+            " Hourly queries preserve the report clock, including repeated/skipped DST hours; "
+            "never derive missing hourly production from daily totals."
         ),
     )
 
@@ -67,6 +75,34 @@ def create_server(source: GenerationSource) -> MCPServer[None]:
             LOGGER.warning("%s", error)
             raise ToolError(str(error)) from None
 
+    if hourly_source is not None:
+        @server.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+            )
+        )
+        async def get_hourly_generation(
+            start_date: str, end_date: str | None = None, format: OutputFormat = "json",
+            refresh: Annotated[bool, Field(strict=True)] = False,
+        ) -> Annotated[CallToolResult, HourlyReport]:
+            """Read hourly plant PV energy in kWh for completed dates, preferring saved hourly files.
+
+            CSV has date rows and hour columns. Repeated clock hours have a #2 suffix;
+            nonexistent clock hours are blank. Missing source readings are zero with flags.
+            Failed source requests are errors, not all-zero days. No daily-to-hourly estimates.
+            """
+            try:
+                report = await hourly_source.fetch(DateRange.parse(start_date, end_date), refresh=refresh)
+                if report.missing_hours:
+                    LOGGER.warning("%d source-missing hours are represented as zero.", len(report.missing_hours))
+                text = hourly_csv(report) if format == "csv" else json.dumps(asdict(report), indent=2) + "\n"
+                return CallToolResult(
+                    content=[TextContent(type="text", text=text)], structured_content=asdict(report)
+                )
+            except StatsError as error:
+                LOGGER.warning("%s", error)
+                raise ToolError(str(error)) from None
+
     return server
 
 
@@ -77,6 +113,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     query.add_argument("--start-date", required=True)
     query.add_argument("--end-date")
     query.add_argument("--format", choices=["json", "csv"], default="json")
+    query.add_argument("--granularity", choices=["day", "hour"], default="day")
     query.add_argument("--refresh", action="store_true", help="Bypass stored files and query FusionSolar.")
     destination = query.add_mutually_exclusive_group()
     destination.add_argument("--output", type=Path)
@@ -90,8 +127,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         source = StoredGenerationSource(
             FusionSolarSource(config), config.plant_id, config.data_dir, config.timeout_seconds
         )
+        hourly_source = StoredHourlySource(
+            FusionSolarSource(config), config.plant_id, config.data_dir, config.time_zone, config.timeout_seconds
+        )
         if args.command == "query":
             interval = DateRange.parse(args.start_date, args.end_date)
+            if args.granularity == "hour":
+                hourly = asyncio.run(hourly_source.fetch(interval, refresh=args.refresh))
+                if hourly.missing_hours:
+                    LOGGER.warning("%d source-missing hours are represented as zero.", len(hourly.missing_hours))
+                if args.output_dir is not None:
+                    for path in save_hourly_years(hourly, args.output_dir):
+                        print(f"Saved {path}", file=sys.stderr)
+                else:
+                    text = hourly_csv(hourly) if args.format == "csv" else json.dumps(asdict(hourly), indent=2) + "\n"
+                    if args.output is None:
+                        sys.stdout.write(text)
+                    else:
+                        try:
+                            args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            with saved_data_lock(args.output.parent, exclusive=True):
+                                save_contents_unlocked(
+                                    text, hourly_metadata(hourly, text) if args.format == "csv" else None, args.output
+                                )
+                        except OSError as error:
+                            raise StatsError("export_failed", f"Could not save the hourly export ({type(error).__name__}).") from error
+                        print(f"Saved {args.output}", file=sys.stderr)
+                return
             report = asyncio.run(source.fetch(interval, refresh=args.refresh))
             if report.missing_dates:
                 LOGGER.warning("%d source-missing dates are represented as zero.", len(report.missing_dates))
@@ -104,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 save_report(report, args.format, args.output)
                 print(f"Saved {args.output}", file=sys.stderr)
         else:
-            create_server(source).run(transport="stdio")
+            create_server(source, hourly_source).run(transport="stdio")
     except StatsError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(2) from None

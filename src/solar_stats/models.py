@@ -8,6 +8,11 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
+MONTH_NAMES = (
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
 
 class StatsError(Exception):
     def __init__(self, code: str, message: str) -> None:

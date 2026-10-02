@@ -280,10 +280,11 @@ Modbus clients or FusionSolar; a later external change can override the result.
 
 ## solar-stats: FusionSolar history
 
-`solar-stats` exposes one read-only tool:
+`solar-stats` exposes two read-only tools:
 
 ```text
 get_generation(start_date, end_date=None, format="json", refresh=False)
+get_hourly_generation(start_date, end_date=None, format="json", refresh=False)
 ```
 
 Dates use `YYYY-MM-DD`. Omitting the end date selects one day; a period is
@@ -326,9 +327,12 @@ retrieval timestamp; new sidecars retain per-date source timestamps.
 
 **Storage management remains deferred.** A query reads existing files but does
 not automatically create a database, synchronize files, or rewrite exports.
-Use `--output` or `--output-dir` to save requested results. These commands replace
-their named output files, so include the full desired coverage for each saved
-year. All local plant data remains private and untracked.
+Use `--output` for a standalone snapshot. Use `--output-dir` for ongoing yearly
+files: it merges new dates into stable `generation-YEAR.csv` names, preserving
+earlier months, existing measured values when a new reading is missing, and newer
+measurements when an older cached result overlaps. Appends must cover intervening
+dates rather than inventing values for unqueried gaps. Coordinated reads/writes
+use a local file lock. All plant data remains private and untracked.
 
 ### Browser-session setup
 
@@ -358,6 +362,7 @@ Sign in directly in that window and open your plant. Copy `.env.solar-stats.exam
 | `SOLAR_STATS_PROFILE_DIR` | Absolute dedicated profile path; managed mode creates it privately and requires directory mode `0700` |
 | `SOLAR_STATS_TIMEOUT_SECONDS` | Whole-query deadline, including waiting for the shared profile; default 300 |
 | `SOLAR_STATS_DATA_DIR` | Directory of private yearly CSVs and metadata; default `state/solar-stats` in the working directory |
+| `SOLAR_STATS_TIMEZONE` | Hourly queries only: the plant report's IANA time zone, validated against the portal request |
 | `SOLAR_STATS_BROWSER_MODE` | `attach` (default) or `managed`; never run both modes against the same profile concurrently |
 | `SOLAR_STATS_HEADLESS` | `true` (default) or `false`, used by managed mode |
 | `SOLAR_STATS_KEYCHAIN_SERVICE` | Optional macOS generic-password item name for automatic login; unset by default |
@@ -428,7 +433,7 @@ uv run --no-sync --env-file .env.solar-stats solar-stats
 ```
 
 For other MCP clients, use the same command with absolute project/configuration
-paths and enable only `get_generation`. This registration is independent of
+paths and enable `get_generation` and `get_hourly_generation`. This registration is independent of
 `solar-mcp`; it requires no inverter address or installer password.
 
 Terminal query mode prints raw JSON or CSV to stdout; diagnostics go to stderr:
@@ -450,11 +455,16 @@ uv run --no-sync --env-file .env.solar-stats solar-stats query \
 
 uv run --no-sync --env-file .env.solar-stats solar-stats query \
   --start-date 2025-01-01 --refresh
+
+uv run --no-sync --env-file .env.solar-stats solar-stats query \
+  --start-date 2026-07-01 --end-date 2026-07-31 --granularity hour \
+  --format csv --output-dir state/solar-stats
 ```
 
-`--output-dir` requires CSV format and writes a separate `generation-YEAR.csv`
+`--output-dir` requires CSV format and updates a separate `generation-YEAR.csv`
 and metadata sidecar for every intersecting year. The first/last year may cover
 only part of that year, such as October-December 2021 or January-September 2026.
+The filename stays `generation-2026.csv` as subsequent months are added.
 `--output` writes a single result
 instead of printing it. CSV output also creates a `.metadata.json` sidecar with
 the source, interval, missing dates, original retrieval timestamps, and CSV checksum. Keep both together: the
@@ -485,6 +495,39 @@ numeric date cells (including February 29) and six nonexistent-date blanks;
 Exports contain private plant data. The repository excludes `state/`, real
 `.env` files, and vendor documentation; never commit report data, profiles,
 cookies, or credentials.
+
+### Hourly history
+
+`get_hourly_generation` (CLI: `query --granularity hour`) reads **PV Yield in kWh
+per hour**, not instantaneous power or an estimate from daily totals. It uses the
+portal's normal **By time range / Hourly statistics** view, splits live periods
+into at most 31 days, and reads all returned pages. It validates dates, labeled
+units, source time zone and daylight-saving labels before accepting data.
+Only completed plant-calendar days are supported. Large uncached requests remain
+subject to the configured query deadline; fetch/save month-sized batches to
+resume a long backfill without repeating saved dates.
+
+Hourly data is separate: `generation-hourly-YEAR.csv` and its metadata sidecar.
+The CSV has a `date` column, columns `00:00` through `23:00`, and an extra `#2`
+column for a repeated clock hour when that year's time zone requires one.
+For example, `03:00#2` retains the second occurrence without combining its energy
+with the first. Nonexistent clock hours and unused repeated-hour cells are blank.
+Real source-missing hours are zero with an explicit metadata flag.
+IANA time-zone data must be available to Python; configure the zone shown by the
+actual plant report, not the computer's current offset.
+
+Saved hourly measurements retain original per-hour source timestamps. Appending
+can fill gaps, but a missing new reading never erases a measured value, and an
+older result never replaces a newer measurement. Partial yearly hourly files
+list their actual `covered_dates` and `unavailable_dates` between the first and
+last saved days. An unavailable date means it is not covered by that file, not
+proof that its generation was zero or that the portal never stored it.
+
+The normal query fails if any requested live range fails; it does not turn HTTP,
+authentication, or unsuccessful report responses into zero-hour rows. Historical
+hourly availability can differ from daily availability. A successful daily report
+does not imply that the same date's hourly measurements can be recovered, and the
+server never distributes a daily total into invented hourly values.
 
 ## Development
 

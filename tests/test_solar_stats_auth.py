@@ -166,6 +166,26 @@ def test_nonblank_portal_error_is_not_replaced_with_another_login(tmp_path, monk
     reader.assert_not_called()
 
 
+def test_authenticated_home_landing_opens_configured_report_without_keychain(tmp_path, monkeypatch) -> None:
+    async def check():
+        config = StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE)
+        source = FusionSolarSource(config)
+        page = MagicMock(url=PLANT_URL.replace("/view/station/NE=123456/report", "/home/list"))
+        async def navigate(url, **kwargs):
+            page.url = url
+        page.goto = AsyncMock(side_effect=navigate)
+        monkeypatch.setattr(source, "_portal_state", AsyncMock(side_effect=["application", "report"]))
+        credentials = AsyncMock()
+        monkeypatch.setattr("solar_stats.browser.keychain_credentials", credentials)
+        assert await source._ensure_report(page) is page
+        page.goto.assert_awaited_once_with(PLANT_URL, wait_until="domcontentloaded")
+        credentials.assert_not_called()
+        assert not config.is_application_page("https://other.example/uniportal/portal")
+        with pytest.raises(StatsError, match="unexpected_login_origin"):
+            config.application_report_url("https://other.example/uniportal/portal")
+    asyncio.run(check())
+
+
 def test_report_matches_the_action_request_not_an_older_response(tmp_path) -> None:
     async def check():
         source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path))

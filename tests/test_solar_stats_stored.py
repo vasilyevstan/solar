@@ -7,6 +7,7 @@ import io
 import json
 import sys
 from contextlib import suppress
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
@@ -21,7 +22,7 @@ from solar_stats import server
 from solar_stats.models import DateRange, StatsError, make_report
 from solar_stats.output import save_report, save_yearly_reports
 from solar_stats.server import create_server
-from solar_stats.stored import StoredGenerationSource, load_saved_days, missing_periods, read_saved_year
+from solar_stats.stored import StoredGenerationSource, load_saved_days, missing_periods, read_saved_year, saved_data_lock
 
 PLANT = "NE=123456"
 PLANT_URL = "https://example.fusionsolar.huawei.com/cloud.html#/view/station/NE=123456/report"
@@ -238,6 +239,53 @@ def test_oldest_partial_year_and_leap_year_split_round_trip(tmp_path):
         rows = list(csv.reader(stream))
     assert len(rows) == 4 and rows[1][:2] == ["2021", "October"] and rows[-1][:2] == ["2021", "December"]
     assert read_saved_year(paths[1], PLANT, 2022)[date(2022, 2, 3)].source_missing
+
+
+def test_yearly_export_appends_dates_without_losing_previous_months(tmp_path):
+    save_yearly_reports(report_for("2026-01-01", "2026-09-30"), tmp_path)
+    result = save_yearly_reports(report_for("2026-10-01", "2026-10-02", amount="2.5"), tmp_path)
+    assert result == [tmp_path / "generation-2026.csv"]
+    days = read_saved_year(result[0], PLANT, 2026)
+    assert len(days) == 275
+    assert days[date(2026, 1, 1)].generation_kwh == 1.25
+    assert days[date(2026, 10, 2)].generation_kwh == 2.5
+    assert days[date(2026, 1, 1)].source_retrieved_at == OLD_TIME
+
+
+def test_yearly_merge_preserves_measurements_and_fills_known_gaps(tmp_path):
+    save_yearly_reports(report_for("2025-01-01", "2025-01-03", missing=("2025-01-03",)), tmp_path)
+    save_yearly_reports(report_for("2025-01-02", "2025-01-03", amount="2.5", missing=("2025-01-02",)), tmp_path)
+    days = read_saved_year(tmp_path / "generation-2025.csv", PLANT, 2025)
+    assert days[date(2025, 1, 1)].generation_kwh == 1.25
+    assert days[date(2025, 1, 2)].generation_kwh == 1.25
+    assert not days[date(2025, 1, 2)].source_missing
+    assert days[date(2025, 1, 3)].generation_kwh == 2.5
+    assert not days[date(2025, 1, 3)].source_missing
+
+
+def test_yearly_merge_does_not_replace_newer_measurements_with_stale_results(tmp_path):
+    save_yearly_reports(report_for("2025-01-01"), tmp_path)
+    stale = report_for("2025-01-01", amount="9")
+    stale = replace(stale, daily=[replace(day, source_retrieved_at="2026-09-01T00:00:00+00:00") for day in stale.daily])
+    save_yearly_reports(stale, tmp_path)
+    assert read_saved_year(tmp_path / "generation-2025.csv", PLANT, 2025)[date(2025, 1, 1)].generation_kwh == 1.25
+
+
+def test_noncontiguous_daily_append_does_not_invent_gap_values_or_replace_files(tmp_path):
+    path = save_yearly_reports(report_for("2025-01-01"), tmp_path)[0]
+    original = (path.read_bytes(), path.with_suffix(".metadata.json").read_bytes())
+    with pytest.raises(StatsError, match="incomplete_export"):
+        save_yearly_reports(report_for("2025-01-03"), tmp_path)
+    assert (path.read_bytes(), path.with_suffix(".metadata.json").read_bytes()) == original
+
+
+def test_saved_reads_wait_for_an_in_progress_export(tmp_path):
+    saved(tmp_path, "2025-01-01")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with saved_data_lock(tmp_path, exclusive=True):
+            pending = pool.submit(load_saved_days, tmp_path, PLANT, DateRange.parse("2025-01-01"))
+            assert not pending.done()
+        assert pending.result(timeout=2)[date(2025, 1, 1)].generation_kwh == 1.25
 
 
 def test_wrong_live_plant_and_query_deadline_are_errors(tmp_path):
