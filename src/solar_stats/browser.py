@@ -16,7 +16,7 @@ from typing import Literal
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as BrowserError
-from playwright.async_api import BrowserContext, Page, Playwright, Response, async_playwright
+from playwright.async_api import BrowserContext, Page, Playwright, Request, async_playwright
 
 from .auth import keychain_credentials
 from .models import DateRange, GenerationReport, StatsError, make_report, parse_month_rows
@@ -76,13 +76,22 @@ class StatsConfig:
         return plant_id
 
     def report_url(self, session_url: str) -> str:
-        if plant_from_url(session_url) != self.plant_id:
+        if not self.is_plant_page(session_url):
             raise StatsError("authentication_required", "Open the configured plant in the dedicated browser.")
         parsed = urlsplit(session_url)
         routing = [(key, value) for key, value in parse_qsl(parsed.query) if key in {"app-id", "instance-id", "zone-id"}]
         return urlunsplit(parsed._replace(
             query=urlencode(routing), fragment=f"/view/station/{self.plant_id}/report"
         ))
+
+    def is_plant_page(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        configured = urlsplit(self.plant_url)
+        return (
+            parsed.hostname == configured.hostname
+            and parsed.path == configured.path
+            and plant_from_url(url) == self.plant_id
+        )
 
     def is_login_url(self, url: str) -> bool:
         parsed = urlsplit(url)
@@ -209,7 +218,7 @@ class FusionSolarSource:
             raise StatsError("local_access_failed", f"Cannot access the browser session ({type(error).__name__}).") from error
 
     def _check_plant(self, page: Page) -> None:
-        if plant_from_url(page.url) != self.config.plant_id:
+        if not self.config.is_plant_page(page.url):
             raise StatsError("authentication_required", "The signed-in page is not the configured plant.")
 
     def _check_login_origin(self, page: Page) -> None:
@@ -264,17 +273,43 @@ class FusionSolarSource:
         finally:
             await result.dispose()
 
-    async def _ensure_report(self, page: Page) -> None:
+    async def _login_destination(self, page: Page, popup: asyncio.Future[Page]) -> tuple[Page, str]:
+        original = asyncio.create_task(self._portal_state(page, after_login=True))
+        try:
+            completed, _ = await asyncio.wait({original, popup}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            if popup in completed:
+                destination = popup.result()
+                destination.set_default_timeout(15000)
+                await destination.wait_for_load_state("domcontentloaded")
+                return destination, await self._portal_state(destination, after_login=True)
+            if original in completed:
+                return page, original.result()
+            raise StatsError("authentication_required", "Login timed out; no login retry was attempted.")
+        finally:
+            original.cancel()
+            await asyncio.gather(original, return_exceptions=True)
+
+    async def _ensure_report(self, page: Page) -> Page:
         state = await self._portal_state(page)
         if state == "report":
             self._check_plant(page)
-            return
+            return page
         if state == "challenge":
             raise StatsError("authentication_required", "Complete the FusionSolar MFA/CAPTCHA challenge manually.")
         if not self.config.keychain_service:
             raise StatsError("authentication_required", "Sign in to the dedicated browser or configure Keychain login.")
         self._check_login_origin(page)
         credentials = await keychain_credentials(self.config.keychain_service)
+        popup: asyncio.Future[Page] = asyncio.get_running_loop().create_future()
+        opened: list[Page] = []
+        accepted: Page | None = None
+
+        def on_popup(child: Page) -> None:
+            opened.append(child)
+            if not popup.done():
+                popup.set_result(child)
+
+        page.on("popup", on_popup)
         try:
             self._check_login_origin(page)
             await page.locator("#username").fill(credentials.username)
@@ -282,7 +317,15 @@ class FusionSolarSource:
             await page.locator("#value").fill(credentials.password)
             self._check_login_origin(page)
             await page.locator("#submitDataverify").click()
-            state = await self._portal_state(page, after_login=True)
+            destination, state = await self._login_destination(page, popup)
+            if state != "report":
+                raise StatsError(
+                    "authentication_required",
+                    "FusionSolar rejected login or requires an interactive challenge; no login retry was attempted.",
+                )
+            self._check_plant(destination)
+            accepted = destination
+            return destination
         except BrowserError:
             raise StatsError(
                 "authentication_required",
@@ -290,17 +333,20 @@ class FusionSolarSource:
             ) from None
         finally:
             del credentials
-        if state != "report":
-            raise StatsError(
-                "authentication_required",
-                "FusionSolar rejected login or requires an interactive challenge; no login retry was attempted.",
-            )
-        self._check_plant(page)
+            page.remove_listener("popup", on_popup)
+            popup.cancel()
+            for child in opened:
+                if child is not accepted:
+                    try:
+                        async with asyncio.timeout(5):
+                            await child.close()
+                    except (BrowserError, TimeoutError):
+                        LOGGER.warning("Could not close an owned login popup.")
 
     async def _fetch(self, interval: DateRange) -> GenerationReport:
         async with async_playwright() as driver, self._browser_context(driver) as context:
             seed = next(
-                (tab for tab in context.pages if plant_from_url(tab.url) == self.config.plant_id), None
+                (tab for tab in context.pages if self.config.is_plant_page(tab.url)), None
             )
             if seed is None and self.config.browser_mode == "attach" and not self.config.keychain_service:
                 raise StatsError("authentication_required", "Open the configured plant in the signed-in dedicated browser.")
@@ -320,7 +366,10 @@ class FusionSolarSource:
                     await page.goto(target, wait_until="domcontentloaded")
                 else:
                     await page.wait_for_load_state("domcontentloaded")
-                await self._ensure_report(page)
+                original = page
+                page = await self._ensure_report(page)
+                if page is not original:
+                    await original.close()
                 await self._granularity(page, "By day")
                 today = DateRange.parse(await page.get_by_placeholder("Select date", exact=True).input_value()).start
                 interval.check_not_future(today)
@@ -353,14 +402,16 @@ class FusionSolarSource:
             await page.get_by_text(value, exact=True).click()
 
     async def _request(self, page: Page, action: Callable[[], Awaitable[None]]) -> ReportPage:
-        def is_report(response: Response) -> bool:
-            parsed = urlsplit(response.url)
+        def is_report(request: Request) -> bool:
+            parsed = urlsplit(request.url)
             return parsed.path == REPORT_PATH and (parsed.hostname or "").endswith(".fusionsolar.huawei.com")
 
-        async with page.expect_response(is_report) as pending:
+        async with page.expect_request(is_report) as pending:
             await action()
-        response = await pending.value
+        response = await (await pending.value).response()
         self._check_plant(page)
+        if response is None:
+            raise StatsError("source_unavailable", "The report request ended without a response.")
         if response.status in {401, 403}:
             raise StatsError("authentication_required", "FusionSolar requires sign-in or report permission.")
         if response.status == 429:

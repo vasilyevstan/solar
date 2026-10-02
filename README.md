@@ -323,6 +323,8 @@ account. No new Python credential dependency or plaintext fallback is used.
 
 Queries reuse an authenticated session first. Only a recognized login page on
 the configured FusionSolar region triggers a Keychain read and one login attempt.
+The adapter follows the application's login popup as well as same-tab redirects;
+a login URL carrying the plant's return address is not treated as a plant tab.
 The username/password stay in local process memory and the browser login form;
 the helper's output is captured privately, never returned through MCP or logs.
 `DEBUG`/`PWDEBUG` must be unset when Keychain login is enabled to avoid browser

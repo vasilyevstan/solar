@@ -216,7 +216,7 @@ def test_query_opens_native_child_tab_and_closes_only_its_own_page(tmp_path, mon
         manager.__aenter__.return_value = driver
         monkeypatch.setattr("solar_stats.browser.async_playwright", lambda: manager)
         monkeypatch.setattr("solar_stats.browser.debugging_port", lambda _: 12345)
-        monkeypatch.setattr(source, "_ensure_report", AsyncMock())
+        monkeypatch.setattr(source, "_ensure_report", AsyncMock(return_value=page))
         monkeypatch.setattr(source, "_granularity", AsyncMock(side_effect=StatsError("probe_complete", "Tab is ready.")))
         with pytest.raises(StatsError, match="probe_complete"):
             await source._fetch(DateRange.parse("2025-01-01"))

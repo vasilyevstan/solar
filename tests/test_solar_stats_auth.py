@@ -118,6 +118,37 @@ def test_login_origin_is_bound_to_configured_region(tmp_path, url) -> None:
     assert not config.is_login_url(url)
 
 
+def test_login_redirect_is_not_an_authenticated_plant_tab(tmp_path) -> None:
+    config = StatsConfig(PLANT_URL, tmp_path)
+    login_redirect = LOGIN_URL + "#/view/station/NE=123456/report"
+    assert config.is_plant_page(PLANT_URL)
+    assert not config.is_plant_page(login_redirect)
+    with pytest.raises(StatsError, match="authentication_required"):
+        config.report_url(login_redirect)
+
+
+def test_report_matches_the_action_request_not_an_older_response(tmp_path) -> None:
+    async def check():
+        source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path))
+        payload = {"success": True, "data": {"total": 0, "pageNo": 1, "pageSize": 100, "list": []}}
+        response = MagicMock(status=200, json=AsyncMock(return_value=payload), finished=AsyncMock(return_value=None))
+        request = MagicMock(url="https://example.fusionsolar.huawei.com/rest/pvms/web/report/v1/station/station-kpi-list",
+                            response=AsyncMock(return_value=response))
+        pending = asyncio.get_running_loop().create_future()
+        pending.set_result(request)
+        page = MagicMock(url=PLANT_URL)
+        page.expect_request.return_value.__aenter__.return_value.value = pending
+        action = AsyncMock()
+        result = await source._request(page, action)
+        assert result.total == 0
+        assert page.expect_request.call_args.args[0](request)
+        page.expect_response.assert_not_called()
+        request.response.assert_awaited_once()
+        response.finished.assert_not_called()
+        action.assert_awaited_once()
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("state", ["report", "challenge"])
 def test_existing_session_or_challenge_never_reads_keychain(tmp_path, monkeypatch, state) -> None:
     source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE))
@@ -196,6 +227,39 @@ def test_single_login_attempt_and_safe_errors(tmp_path, monkeypatch, outcome) ->
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("state", ["report", "challenge"])
+def test_login_follows_only_its_own_popup_and_cleans_up_failures(tmp_path, monkeypatch, state) -> None:
+    async def check():
+        source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE))
+        page = MagicMock(url=LOGIN_URL)
+        child = MagicMock(url=PLANT_URL, wait_for_load_state=AsyncMock(), close=AsyncMock())
+        page.locator.return_value.fill = AsyncMock()
+        async def clicked():
+            event, callback = page.on.call_args.args
+            assert event == "popup"
+            callback(child)
+        page.locator.return_value.click = AsyncMock(side_effect=clicked)
+        async def portal_state(candidate, *, after_login=False):
+            if candidate is child:
+                return state
+            if after_login:
+                await asyncio.sleep(30)
+            return "login"
+        monkeypatch.setattr(source, "_portal_state", portal_state)
+        monkeypatch.setattr("solar_stats.browser.keychain_credentials",
+                            AsyncMock(return_value=Credentials("synthetic-account", "synthetic-password")))
+        if state == "report":
+            assert await source._ensure_report(page) is child
+            child.close.assert_not_called()
+        else:
+            with pytest.raises(StatsError, match="interactive challenge"):
+                await source._ensure_report(page)
+            child.close.assert_awaited_once()
+        page.locator.return_value.click.assert_awaited_once()
+        page.remove_listener.assert_called_once()
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_managed_browser_headless_start_and_cleanup(tmp_path, fails) -> None:
     async def check():
@@ -240,7 +304,7 @@ def test_managed_queries_reuse_the_owned_tab_without_accumulating_popups(tmp_pat
         manager = MagicMock()
         manager.__aenter__.return_value = driver
         monkeypatch.setattr("solar_stats.browser.async_playwright", lambda: manager)
-        monkeypatch.setattr(source, "_ensure_report", AsyncMock())
+        monkeypatch.setattr(source, "_ensure_report", AsyncMock(return_value=page))
         monkeypatch.setattr(source, "_granularity", AsyncMock(side_effect=StatsError("ready", "Owned tab ready.")))
         with pytest.raises(StatsError, match="ready"):
             await source._fetch(DateRange.parse("2023-01-01"))
