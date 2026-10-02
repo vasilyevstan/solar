@@ -228,9 +228,17 @@ def test_hourly_request_is_bound_to_the_period_clock_and_page(tmp_path):
         with pytest.raises(StatsError, match="different report time zone"):
             await source._hourly_request(page, AsyncMock(), period, 1)
         request.post_data_json = body
-        response.json.return_value = {"success": False, "data": {"list": [], "total": 0}}
+        response.json.return_value = {"success": False, "failCode": 0, "message": None, "data": {"list": [], "total": 0}}
         with pytest.raises(StatsError, match="hourly_report_unavailable"):
             await source._hourly_request(page, AsyncMock(), period, 1)
+        for failed in (
+            {"success": False, "failCode": 123, "data": {"list": [], "total": 0}},
+            {"success": False, "failCode": 0, "message": "access denied", "data": {"list": [], "total": 0}},
+            {"success": False, "failCode": 0, "data": {"list": [None], "total": 1}},
+        ):
+            response.json.return_value = failed
+            with pytest.raises(StatsError, match="source_unavailable"):
+                await source._hourly_request(page, AsyncMock(), period, 1)
     asyncio.run(check())
 
 
@@ -294,3 +302,46 @@ def test_hourly_stdio_works_without_browser_or_credentials(tmp_path):
                 assert not result.is_error
                 assert result.structured_content["source_complete"] and result.structured_content["portal_hours"] == 0
     asyncio.run(check())
+
+
+def test_bulk_export_keeps_successful_months_and_reports_unavailable_periods(tmp_path):
+    class Source:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch(self, period, *, refresh=False):
+            self.calls.append(period)
+            if period.start.month == 1:
+                raise StatsError("hourly_report_unavailable", "Empty source report.")
+            return make_hours(period.start.isoformat(), period.end.isoformat())
+
+    source = Source()
+    with pytest.raises(StatsError, match="incomplete_hourly_export"):
+        asyncio.run(server.export_hourly_batches(
+            source, DateRange.parse("2025-01-01", "2025-03-31"), tmp_path
+        ))
+    assert len(source.calls) == 3
+    days = read_hourly_year(tmp_path / "generation-hourly-2025.csv", PLANT, 2025, ZONE)
+    assert len(days) == 59 and min(days) == date(2025, 2, 1)
+    assert not any(day.month == 1 for day in days)
+
+
+@pytest.mark.parametrize("code", ["authentication_required", "rate_limited", "source_unavailable", "wrong_period"])
+def test_bulk_export_stops_on_real_failures_without_losing_completed_months(tmp_path, code):
+    class Source:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch(self, period, *, refresh=False):
+            self.calls.append(period)
+            if period.start.month == 2:
+                raise StatsError(code, "Stop the batch.")
+            return make_hours(period.start.isoformat(), period.end.isoformat())
+
+    source = Source()
+    with pytest.raises(StatsError, match=code):
+        asyncio.run(server.export_hourly_batches(
+            source, DateRange.parse("2025-01-01", "2025-03-31"), tmp_path
+        ))
+    assert len(source.calls) == 2
+    assert len(read_hourly_year(tmp_path / "generation-hourly-2025.csv", PLANT, 2025, ZONE)) == 31

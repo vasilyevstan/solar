@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import json
 import logging
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Protocol
 
@@ -30,6 +32,32 @@ class GenerationSource(Protocol):
 
 class HourlySource(Protocol):
     async def fetch(self, interval: DateRange, *, refresh: bool = False) -> HourlyReport: ...
+
+
+async def export_hourly_batches(
+    source: HourlySource, interval: DateRange, directory: Path, *, refresh: bool = False
+) -> None:
+    unavailable = []
+    for year, month in interval.months():
+        period = DateRange(
+            max(interval.start, date(year, month, 1)),
+            min(interval.end, date(year, month, calendar.monthrange(year, month)[1])),
+        )
+        try:
+            report = await source.fetch(period, refresh=refresh)
+        except StatsError as error:
+            if error.code != "hourly_report_unavailable":
+                raise
+            LOGGER.warning("%s", error)
+            unavailable.append(f"{period.start} through {period.end}")
+            continue
+        for path in save_hourly_years(report, directory):
+            print(f"Saved {path} ({period.start} through {period.end})", file=sys.stderr, flush=True)
+    if unavailable:
+        raise StatsError(
+            "incomplete_hourly_export",
+            "Successful batches were saved; no hourly records were returned for: " + "; ".join(unavailable),
+        )
 
 
 def create_server(source: GenerationSource, hourly_source: HourlySource | None = None) -> MCPServer[None]:
@@ -133,26 +161,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.command == "query":
             interval = DateRange.parse(args.start_date, args.end_date)
             if args.granularity == "hour":
+                if args.output_dir is not None:
+                    asyncio.run(export_hourly_batches(
+                        hourly_source, interval, args.output_dir, refresh=args.refresh
+                    ))
+                    return
                 hourly = asyncio.run(hourly_source.fetch(interval, refresh=args.refresh))
                 if hourly.missing_hours:
                     LOGGER.warning("%d source-missing hours are represented as zero.", len(hourly.missing_hours))
-                if args.output_dir is not None:
-                    for path in save_hourly_years(hourly, args.output_dir):
-                        print(f"Saved {path}", file=sys.stderr)
+                text = hourly_csv(hourly) if args.format == "csv" else json.dumps(asdict(hourly), indent=2) + "\n"
+                if args.output is None:
+                    sys.stdout.write(text)
                 else:
-                    text = hourly_csv(hourly) if args.format == "csv" else json.dumps(asdict(hourly), indent=2) + "\n"
-                    if args.output is None:
-                        sys.stdout.write(text)
-                    else:
-                        try:
-                            args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                            with saved_data_lock(args.output.parent, exclusive=True):
-                                save_contents_unlocked(
-                                    text, hourly_metadata(hourly, text) if args.format == "csv" else None, args.output
-                                )
-                        except OSError as error:
-                            raise StatsError("export_failed", f"Could not save the hourly export ({type(error).__name__}).") from error
-                        print(f"Saved {args.output}", file=sys.stderr)
+                    try:
+                        args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        with saved_data_lock(args.output.parent, exclusive=True):
+                            save_contents_unlocked(
+                                text, hourly_metadata(hourly, text) if args.format == "csv" else None, args.output
+                            )
+                    except OSError as error:
+                        raise StatsError("export_failed", f"Could not save the hourly export ({type(error).__name__}).") from error
+                    print(f"Saved {args.output}", file=sys.stderr)
                 return
             report = asyncio.run(source.fetch(interval, refresh=args.refresh))
             if report.missing_dates:

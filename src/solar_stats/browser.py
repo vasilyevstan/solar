@@ -572,9 +572,20 @@ class FusionSolarSource:
         except ValueError:
             raise StatsError("portal_changed", "The hourly response was not JSON.") from None
         if isinstance(payload, dict) and payload.get("success") is not True:
+            data = payload.get("data")
+            empty_report = (
+                number == 1 and payload.get("success") is False
+                and type(payload.get("failCode")) is int and payload["failCode"] == 0
+                and payload.get("message") in (None, "")
+                and isinstance(data, dict) and data.get("list") == [] and data.get("total") == 0
+            )
+            if not empty_report:
+                raise StatsError(
+                    "source_unavailable", "FusionSolar rejected the hourly request; this is not an empty-data result."
+                )
             raise StatsError(
                 "hourly_report_unavailable",
-                f"FusionSolar did not return a successful hourly report for {interval.start} through {interval.end}; "
+                f"FusionSolar returned an empty unsuccessful hourly report for {interval.start} through {interval.end}; "
                 "no zero production was substituted.",
             )
         return validate_report_page(payload)

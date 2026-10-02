@@ -504,8 +504,11 @@ portal's normal **By time range / Hourly statistics** view, splits live periods
 into at most 31 days, and reads all returned pages. It validates dates, labeled
 units, source time zone and daylight-saving labels before accepting data.
 Only completed plant-calendar days are supported. Large uncached requests remain
-subject to the configured query deadline; fetch/save month-sized batches to
-resume a long backfill without repeating saved dates.
+subject to the configured query deadline. With `--output-dir`, the CLI saves each
+month-sized batch before continuing, so rerunning resumes from saved dates.
+Explicit empty unsuccessful reports are listed as unavailable, not zero-filled
+periods; other failures stop the run. If any period is unavailable the command
+exits with an error after retaining completed batches.
 
 Hourly data is separate: `generation-hourly-YEAR.csv` and its metadata sidecar.
 The CSV has a `date` column, columns `00:00` through `23:00`, and an extra `#2`
