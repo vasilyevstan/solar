@@ -45,7 +45,7 @@ class FakeSource:
         self.calls = 0
         self.fail = False
 
-    async def fetch(self, interval: DateRange) -> GenerationReport:
+    async def fetch(self, interval: DateRange, *, refresh: bool = False) -> GenerationReport:
         self.calls += 1
         if self.fail:
             raise StatsError("authentication_required", "Sign in to the dedicated browser.")
@@ -276,7 +276,7 @@ def test_source_deadlines_and_safe_browser_errors(tmp_path, monkeypatch) -> None
     asyncio.run(check())
 
 
-def test_mcp_results_csv_errors_and_no_cache() -> None:
+def test_mcp_results_csv_errors_and_source_delegation() -> None:
     async def check():
         source = FakeSource()
         server = create_server(source)
@@ -318,6 +318,7 @@ def test_cli_stdout_and_file_output(tmp_path, monkeypatch, capsys) -> None:
     fake = FakeSource()
     monkeypatch.setenv("SOLAR_STATS_PLANT_URL", PLANT_URL)
     monkeypatch.setenv("SOLAR_STATS_PROFILE_DIR", str(tmp_path))
+    monkeypatch.setenv("SOLAR_STATS_DATA_DIR", str(tmp_path / "saved"))
     monkeypatch.setattr(server_module, "FusionSolarSource", lambda _: fake)
     arguments = ["query", "--start-date", "2025-01-01", "--end-date", "2025-01-02"]
     server_module.main(arguments)
@@ -342,7 +343,8 @@ def test_real_stdio_discovery_does_not_need_browser_and_no_modbus_import(tmp_pat
     async def check():
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "solar_stats.server"],
-            env={"SOLAR_STATS_PLANT_URL": PLANT_URL, "SOLAR_STATS_PROFILE_DIR": str(tmp_path)},
+            env={"SOLAR_STATS_PLANT_URL": PLANT_URL, "SOLAR_STATS_PROFILE_DIR": str(tmp_path),
+                 "SOLAR_STATS_DATA_DIR": str(tmp_path / "saved")},
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:

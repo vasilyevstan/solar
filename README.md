@@ -283,20 +283,52 @@ Modbus clients or FusionSolar; a later external change can override the result.
 `solar-stats` exposes one read-only tool:
 
 ```text
-get_generation(start_date, end_date=None, format="json")
+get_generation(start_date, end_date=None, format="json", refresh=False)
 ```
 
 Dates use `YYYY-MM-DD`. Omitting the end date selects one day; a period is
 inclusive and may cross years. The default structured result includes:
 
 - `generation_kwh`: the requested period's sum, in **kWh**, not instantaneous kW.
-- `daily`: each requested date, its `generation_kwh`, and `source_missing`.
-- `missing_dates`, `source_complete`, source/plant identity, and UTC `retrieved_at`.
+- `daily`: each date, its `generation_kwh`, `source_missing`, `from_cache`, and original `source_retrieved_at`.
+- `missing_dates`, `source_complete`, source/plant identity, and UTC `retrieved_at` (when this result was assembled).
+- `retrieval_mode`: `stored_file`, `portal`, or `mixed`, with `cached_days` and `portal_days` counting returned days from each source.
 - `date_basis: "plant_report_calendar"`: source daily labels are not shifted to UTC.
 
 The metric is **Plant Report / PV Yield (kWh)**, not inverter lifetime counters,
-household consumption, export, or revenue. Queries read FusionSolar each time;
-saved CSVs are exports, **never a default cache or fallback**.
+household consumption, export, or revenue.
+
+### Saved-file preference
+
+Queries now prefer existing date records in local yearly CSVs, including genuine
+measured zeroes and explicitly flagged missing-value zero fills. They validate the matching metadata's plant identity,
+metric, units, date coverage, missing flags, total, and CSV checksum. A complete
+file hit does not launch Chrome, contact FusionSolar, or read Keychain credentials.
+
+Only dates not covered by saved files are requested from the portal.
+Requests are grouped by the monthly reporting periods actually needed; saved
+measurements are retained rather than overwritten by unrelated rows returned in
+the same monthly report. Portal failures remain errors, never partial results or
+fabricated zeroes. `refresh=True` in MCP, or `--refresh` in the CLI, bypasses local
+files entirely when you need updated measurements, to recheck known source gaps,
+or to refresh a still-changing current day's generation. A stored missing-value
+zero remains `source_missing: true`; using it from a file never turns it into a
+confirmed measurement.
+
+Configure `SOLAR_STATS_DATA_DIR` (default: `state/solar-stats` under the process
+working directory). Preferred files are `generation-YEAR.csv` with matching
+`.metadata.json` sidecars. If the canonical file is absent, matching partial
+exports such as `generation-2026-jan-sep.csv` are accepted; conflicting overlapping
+measurements are errors. An invalid file or mismatched pair fails explicitly.
+Use refresh to bypass it, and an explicit export to replace it when appropriate.
+Original files without per-date timestamps remain readable using their original
+retrieval timestamp; new sidecars retain per-date source timestamps.
+
+**Storage management remains deferred.** A query reads existing files but does
+not automatically create a database, synchronize files, or rewrite exports.
+Use `--output` or `--output-dir` to save requested results. These commands replace
+their named output files, so include the full desired coverage for each saved
+year. All local plant data remains private and untracked.
 
 ### Browser-session setup
 
@@ -325,6 +357,7 @@ Sign in directly in that window and open your plant. Copy `.env.solar-stats.exam
 | `SOLAR_STATS_PLANT_URL` | Your authenticated plant page containing `/view/station/NE=...`; no query parameters, passwords, or tokens |
 | `SOLAR_STATS_PROFILE_DIR` | Absolute dedicated profile path; managed mode creates it privately and requires directory mode `0700` |
 | `SOLAR_STATS_TIMEOUT_SECONDS` | Whole-query deadline, including waiting for the shared profile; default 300 |
+| `SOLAR_STATS_DATA_DIR` | Directory of private yearly CSVs and metadata; default `state/solar-stats` in the working directory |
 | `SOLAR_STATS_BROWSER_MODE` | `attach` (default) or `managed`; never run both modes against the same profile concurrently |
 | `SOLAR_STATS_HEADLESS` | `true` (default) or `false`, used by managed mode |
 | `SOLAR_STATS_KEYCHAIN_SERVICE` | Optional macOS generic-password item name for automatic login; unset by default |
@@ -370,6 +403,8 @@ Queries reuse an authenticated session first. Only a recognized login page on
 the configured FusionSolar region triggers a Keychain read and one login attempt.
 The adapter follows the application's login popup as well as same-tab redirects;
 a login URL carrying the plant's return address is not treated as a plant tab.
+If a restored application tab stays blank, configured Keychain login may reopen
+the normal regional sign-in page once before attempting authentication.
 The username/password stay in local process memory and the browser login form;
 the helper's output is captured privately, never returned through MCP or logs.
 `DEBUG`/`PWDEBUG` must be unset when Keychain login is enabled to avoid browser
@@ -408,12 +443,21 @@ uv run --no-sync --env-file .env.solar-stats solar-stats query \
 uv run --no-sync --env-file .env.solar-stats solar-stats query \
   --start-date 2025-01-01 --end-date 2025-12-31 --format csv \
   --output state/solar-stats/generation-2025.csv
+
+uv run --no-sync --env-file .env.solar-stats solar-stats query \
+  --start-date 2021-10-01 --end-date 2026-09-30 --format csv \
+  --output-dir state/solar-stats
+
+uv run --no-sync --env-file .env.solar-stats solar-stats query \
+  --start-date 2025-01-01 --refresh
 ```
 
-Use a separate query/output filename for each year, including 2023 or 2024.
-`--output` writes the result
+`--output-dir` requires CSV format and writes a separate `generation-YEAR.csv`
+and metadata sidecar for every intersecting year. The first/last year may cover
+only part of that year, such as October-December 2021 or January-September 2026.
+`--output` writes a single result
 instead of printing it. CSV output also creates a `.metadata.json` sidecar with
-the source, interval, missing dates, and CSV checksum. Keep both together: the
+the source, interval, missing dates, original retrieval timestamps, and CSV checksum. Keep both together: the
 checksum detects an interrupted export or subsequent edits. Existing CSVs are
 not modified if fetching fails.
 

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import Error as BrowserError
+from playwright.async_api import TimeoutError as BrowserTimeoutError
 
 from solar_stats import auth
 from solar_stats.auth import Credentials, keychain_credentials
@@ -125,6 +126,44 @@ def test_login_redirect_is_not_an_authenticated_plant_tab(tmp_path) -> None:
     assert not config.is_plant_page(login_redirect)
     with pytest.raises(StatsError, match="authentication_required"):
         config.report_url(login_redirect)
+
+
+def test_blank_restored_app_reopens_normal_login_once(tmp_path, monkeypatch) -> None:
+    async def check():
+        config = StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE)
+        assert config.is_login_url(config.login_url)
+        source = FusionSolarSource(config)
+        page = MagicMock(url=PLANT_URL)
+        page.locator.return_value.inner_text = AsyncMock(return_value="")
+        page.locator.return_value.fill = AsyncMock()
+        async def navigate(url, **kwargs):
+            page.url = url
+        async def clicked():
+            page.url = PLANT_URL
+        page.goto = AsyncMock(side_effect=navigate)
+        page.locator.return_value.click = AsyncMock(side_effect=clicked)
+        monkeypatch.setattr(source, "_portal_state",
+                            AsyncMock(side_effect=[BrowserTimeoutError("blank"), "login", "report"]))
+        reader = AsyncMock(return_value=Credentials("synthetic-account", "synthetic-password"))
+        monkeypatch.setattr("solar_stats.browser.keychain_credentials", reader)
+        assert await source._ensure_report(page) is page
+        page.goto.assert_awaited_once_with(config.login_url, wait_until="domcontentloaded")
+        reader.assert_awaited_once_with(SERVICE)
+        page.locator.return_value.click.assert_awaited_once()
+    asyncio.run(check())
+
+
+def test_nonblank_portal_error_is_not_replaced_with_another_login(tmp_path, monkeypatch) -> None:
+    source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE))
+    page = MagicMock(url=PLANT_URL)
+    page.locator.return_value.inner_text = AsyncMock(return_value="Maintenance")
+    monkeypatch.setattr(source, "_portal_state", AsyncMock(side_effect=BrowserTimeoutError("not ready")))
+    reader = AsyncMock()
+    monkeypatch.setattr("solar_stats.browser.keychain_credentials", reader)
+    with pytest.raises(BrowserTimeoutError):
+        asyncio.run(source._ensure_report(page))
+    page.goto.assert_not_called()
+    reader.assert_not_called()
 
 
 def test_report_matches_the_action_request_not_an_older_response(tmp_path) -> None:

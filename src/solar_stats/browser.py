@@ -8,7 +8,7 @@ import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -16,6 +16,7 @@ from typing import Literal
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as BrowserError
+from playwright.async_api import TimeoutError as BrowserTimeoutError
 from playwright.async_api import BrowserContext, Page, Playwright, Request, async_playwright
 
 from .auth import keychain_credentials
@@ -48,6 +49,7 @@ class StatsConfig:
     browser_mode: Literal["attach", "managed"] = "attach"
     headless: bool = True
     keychain_service: str | None = None
+    data_dir: Path = field(default_factory=lambda: Path("state/solar-stats").resolve())
 
     def __post_init__(self) -> None:
         try:
@@ -59,6 +61,8 @@ class StatsConfig:
             raise StatsError("invalid_config", "Set SOLAR_STATS_PLANT_URL to the plant page without query parameters.")
         if not self.profile_dir.is_absolute():
             raise StatsError("invalid_config", "SOLAR_STATS_PROFILE_DIR must be an absolute dedicated-profile path.")
+        if not self.data_dir.is_absolute():
+            raise StatsError("invalid_config", "SOLAR_STATS_DATA_DIR must be an absolute directory path.")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise StatsError("invalid_config", "SOLAR_STATS_TIMEOUT_SECONDS must be finite and positive.")
         if self.browser_mode not in {"attach", "managed"} or type(self.headless) is not bool:
@@ -106,6 +110,11 @@ class StatsConfig:
             and parsed.path == "/unisso/login.action"
         )
 
+    @property
+    def login_url(self) -> str:
+        host = re.sub(r"^uni\d+", "", urlsplit(self.plant_url).hostname or "")
+        return urlunsplit(("https", host, "/unisso/login.action", "", f"/view/station/{self.plant_id}/report"))
+
     @classmethod
     def from_environment(cls) -> StatsConfig:
         url = os.environ.get("SOLAR_STATS_PLANT_URL", "")
@@ -123,6 +132,7 @@ class StatsConfig:
         return cls(
             url, Path(profile).expanduser(), timeout, "attach" if mode == "attach" else "managed", headless == "true",
             os.environ.get("SOLAR_STATS_KEYCHAIN_SERVICE"),
+            Path(os.environ.get("SOLAR_STATS_DATA_DIR", "state/solar-stats")).expanduser().resolve(),
         )
 
 
@@ -290,7 +300,18 @@ class FusionSolarSource:
             await asyncio.gather(original, return_exceptions=True)
 
     async def _ensure_report(self, page: Page) -> Page:
-        state = await self._portal_state(page)
+        try:
+            state = await self._portal_state(page)
+        except BrowserTimeoutError:
+            if (
+                not self.config.keychain_service
+                or not self.config.is_plant_page(page.url)
+                or (await page.locator("body").inner_text()).strip()
+            ):
+                raise
+            LOGGER.warning("The restored portal tab is blank; reopening the normal regional sign-in page once.")
+            await page.goto(self.config.login_url, wait_until="domcontentloaded")
+            state = await self._portal_state(page)
         if state == "report":
             self._check_plant(page)
             return page

@@ -8,11 +8,12 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from .models import DateRange, GenerationReport, StatsError
+from .models import DateRange, GenerationReport, StatsError, report_from_days
 
 OutputFormat = Literal["json", "csv"]
 MONTH_NAMES = (
@@ -48,6 +49,9 @@ def metadata(report: GenerationReport, csv_content: str) -> dict[str, object]:
     result.pop("daily")
     result["zero_filled_count"] = len(report.missing_dates)
     result["csv_sha256"] = hashlib.sha256(csv_content.encode()).hexdigest()
+    result["source_retrieved_at"] = {
+        day.date: day.source_retrieved_at or report.retrieved_at for day in report.daily
+    }
     return result
 
 
@@ -76,7 +80,7 @@ def save_report(report: GenerationReport, output_format: OutputFormat, path: Pat
             sidecar = path.with_suffix(".metadata.json")
             meta_file = _stage_file(sidecar, json.dumps(metadata(report, content), indent=2) + "\n")
             staged.append(meta_file)
-            # The checksum detects interrupted two-file publication; queries never use these exports as a cache.
+            # Readers reject a mismatched pair if publication is interrupted between the two replacements.
             os.replace(meta_file, sidecar)
         os.replace(data_file, path)
     except OSError as error:
@@ -84,3 +88,16 @@ def save_report(report: GenerationReport, output_format: OutputFormat, path: Pat
     finally:
         for temporary in staged:
             temporary.unlink(missing_ok=True)
+
+
+def save_yearly_reports(report: GenerationReport, directory: Path) -> list[Path]:
+    interval = DateRange.parse(report.start_date, report.end_date)
+    readings = {date.fromisoformat(day.date): day for day in report.daily}
+    paths = []
+    for year in range(interval.start.year, interval.end.year + 1):
+        period = DateRange(max(interval.start, date(year, 1, 1)), min(interval.end, date(year, 12, 31)))
+        yearly = report_from_days(period, report.plant_id, readings)
+        path = directory / f"generation-{year}.csv"
+        save_report(yearly, "csv", path)
+        paths.append(path)
+    return paths

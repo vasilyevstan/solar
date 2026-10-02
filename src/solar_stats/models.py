@@ -3,7 +3,7 @@ from __future__ import annotations
 import calendar
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
@@ -54,6 +54,8 @@ class GenerationDay:
     date: str
     generation_kwh: float
     source_missing: bool
+    source_retrieved_at: str | None = None
+    from_cache: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,9 @@ class GenerationReport:
     source: Literal["fusionsolar_plant_report"] = "fusionsolar_plant_report"
     date_basis: Literal["plant_report_calendar"] = "plant_report_calendar"
     aggregation: Literal["sum_with_missing_as_zero"] = "sum_with_missing_as_zero"
+    retrieval_mode: Literal["portal", "stored_file", "mixed"] = "portal"
+    cached_days: int = 0
+    portal_days: int = 0
 
 
 def parse_kwh(text: str) -> Decimal | None:
@@ -125,13 +130,14 @@ def make_report(
     days = []
     missing = []
     total = Decimal(0)
+    retrieved_at = datetime.now(UTC).isoformat()
     for day in interval.dates():
         value = months[(day.year, day.month)].get(day)
         if value is None:
             missing.append(day.isoformat())
         amount = Decimal(0) if value is None else value
         total += amount
-        days.append(GenerationDay(day.isoformat(), float(amount), value is None))
+        days.append(GenerationDay(day.isoformat(), float(amount), value is None, retrieved_at))
     if not math.isfinite(float(total)):
         raise StatsError("invalid_source_data", "The period total is outside the supported numeric range.")
     return GenerationReport(
@@ -142,5 +148,30 @@ def make_report(
         daily=days,
         missing_dates=missing,
         source_complete=not missing,
-        retrieved_at=datetime.now(UTC).isoformat(),
+        retrieved_at=retrieved_at,
+        portal_days=len(days),
+    )
+
+
+def report_from_days(
+    interval: DateRange, plant_id: str, readings: dict[date, GenerationDay]
+) -> GenerationReport:
+    months: dict[tuple[int, int], dict[date, Decimal | None]] = {month: {} for month in interval.months()}
+    for day in interval.dates():
+        if day not in readings:
+            raise StatsError("incomplete_source", "Not every requested date was retrieved.")
+        item = readings[day]
+        if item.date != day.isoformat() or (item.source_missing and item.generation_kwh != 0):
+            raise StatsError("invalid_source_data", "Daily reading provenance is inconsistent.")
+        months[(day.year, day.month)][day] = None if item.source_missing else Decimal(str(item.generation_kwh))
+    report = make_report(interval, plant_id, months)
+    daily = [
+        replace(day, from_cache=readings[date.fromisoformat(day.date)].from_cache,
+                source_retrieved_at=readings[date.fromisoformat(day.date)].source_retrieved_at)
+        for day in report.daily
+    ]
+    cached = sum(day.from_cache for day in daily)
+    return replace(
+        report, daily=daily, cached_days=cached, portal_days=len(daily) - cached,
+        retrieval_mode="stored_file" if cached == len(daily) else "mixed" if cached else "portal",
     )
