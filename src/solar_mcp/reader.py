@@ -23,13 +23,14 @@ from huawei_solar.registers import REGISTERS
 from tmodbus import AsyncSmartTransport, AsyncTcpTransport
 from tmodbus.exceptions import TModbusError
 
-from .models import GenerationLimit, GenerationLimitChange, SolarSnapshot
+from .models import GenerationLimit, GenerationLimitChange, PowerLimitChange, PowerLimitMode, SolarSnapshot
 
 LOGGER = logging.getLogger(__name__)
 CACHE_SECONDS = 30.0
 REFRESH_TIMEOUT_SECONDS = 30.0
 CLOSE_TIMEOUT_SECONDS = 2.0
 CAP_REGISTER = REGISTERS[rn.ACTIVE_POWER_PERCENTAGE_DERATING].register
+WATT_CAP_REGISTER = REGISTERS[rn.ACTIVE_POWER_FIXED_VALUE_DERATING].register
 
 
 class SolarReadError(Exception):
@@ -131,10 +132,41 @@ def _percent_tenths(value: object) -> int:
     return int(scaled)
 
 
-def _change_result(
-    previous: float, actual: GenerationLimit, *, changed: bool, request_id: str | None
-) -> GenerationLimitChange:
-    active_matches = actual.percent == actual.active_percent
+def _watts(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SolarControlError("A watt limit must be a whole number from 0 to the inverter's Pmax.")
+    number = Decimal(str(value))
+    if not number.is_finite() or not 0 <= number < 0xFFFFFFFF or number != number.to_integral_value():
+        raise SolarControlError("A watt limit must be a whole number from 0 to the inverter's Pmax.")
+    return int(number)
+
+
+def _limit_value(mode: PowerLimitMode, value: object) -> float | int:
+    if mode == "percent":
+        return _percent_tenths(value) / 10
+    if mode == "watts":
+        return _watts(value)
+    raise SolarControlError("The power-limit mode must be percent or watts.")
+
+
+def _limit_values(limit: GenerationLimit) -> tuple[float | int, float | int]:
+    if limit.mode == "percent" and limit.percent is not None and limit.active_percent is not None:
+        return limit.percent, limit.active_percent
+    if limit.mode == "watts" and limit.watts is not None and limit.active_watts is not None:
+        return limit.watts, limit.active_watts
+    raise SolarControlError("The generation-cap readback is incomplete.")
+
+
+def _power_change_result(
+    previous: GenerationLimit,
+    mode: PowerLimitMode,
+    requested: float | int,
+    actual: GenerationLimit,
+    *,
+    written: bool,
+    request_id: str | None,
+) -> PowerLimitChange:
+    active_matches = actual.mode == mode and _limit_values(actual)[1] == requested
     warning = None
     if not active_matches:
         warning = (
@@ -142,7 +174,7 @@ def _change_result(
             "The output restriction is not confirmed; it may be pending or overridden."
         )
         LOGGER.warning("%s", warning)
-    return GenerationLimitChange(previous, actual, changed, request_id, active_matches, warning)
+    return PowerLimitChange(previous, mode, requested, actual, written, request_id, active_matches, warning)
 
 
 class HuaweiSolarReader:
@@ -224,7 +256,6 @@ class HuaweiSolarReader:
                 raise
 
     async def _read_generation_limit(self, client: ReadClient) -> GenerationLimit:
-        configured = _percent_tenths((await client.get(rn.ACTIVE_POWER_PERCENTAGE_DERATING)).value)
         values = await client.get_multiple(
             [
                 rn.ACTIVE_POWER_ADJUSTMENT_MODE,
@@ -235,19 +266,41 @@ class HuaweiSolarReader:
         if len(values) != 3 or any(type(result.value) is not int for result in values):
             raise SolarControlError("Invalid or missing active generation-cap data.")
         mode, active, command = (result.value for result in values)
-        if mode != 0 or command != CAP_REGISTER:
+        if (mode, command) not in {(0, CAP_REGISTER), (1, WATT_CAP_REGISTER)}:
             raise SolarControlError(
-                "The inverter is not using the supported percentage-cap mode. "
+                "The inverter is not using a supported percentage or fixed-watt cap. "
                 "Refusing to replace another control mode."
             )
-        if not isinstance(active, int) or not 0 <= active <= 1000:
-            raise SolarControlError("Invalid active generation-cap percentage.")
+        if mode == 0:
+            if not 0 <= active <= 1000:
+                raise SolarControlError("Invalid active generation-cap percentage.")
+            configured = _percent_tenths((await client.get(rn.ACTIVE_POWER_PERCENTAGE_DERATING)).value)
+            return GenerationLimit(
+                observed_at=datetime.now(UTC),
+                percent=configured / 10,
+                active_percent=active / 10,
+                control_enabled=self.control_enabled,
+            )
+        configured_watts = _watts((await client.get(rn.ACTIVE_POWER_FIXED_VALUE_DERATING)).value)
+        active_watts = _watts(active)
+        maximum = await self._maximum_power(client)
+        if max(configured_watts, active_watts) > maximum:
+            raise SolarControlError("Invalid fixed-watt cap: the readback exceeds the inverter's Pmax.")
         return GenerationLimit(
             observed_at=datetime.now(UTC),
-            percent=configured / 10,
-            active_percent=active / 10,
+            percent=None,
+            active_percent=None,
             control_enabled=self.control_enabled,
+            mode="watts",
+            watts=configured_watts,
+            active_watts=active_watts,
         )
+
+    async def _maximum_power(self, client: ReadClient) -> int:
+        maximum = _watts((await client.get(rn.P_MAX)).value)
+        if maximum == 0:
+            raise SolarControlError("The inverter's Pmax is invalid; no cap write was attempted.")
+        return maximum
 
     async def get_generation_limit(self) -> GenerationLimit:
         try:
@@ -276,32 +329,73 @@ class HuaweiSolarReader:
         expected_current_percent: float,
         expected_active_percent: float | None = None,
     ) -> GenerationLimitChange:
+        result = await self._set_power_limit(
+            "percent", percent, "percent", expected_current_percent,
+            expected_current_percent if expected_active_percent is None else expected_active_percent,
+            reassert=False,
+        )
+        if result.previous.percent is None:
+            raise SolarControlError("The previous cap was not a percentage.")
+        return GenerationLimitChange(
+            result.previous.percent, result.limit, result.write_performed, result.request_id,
+            result.active_readback_matches, result.warning,
+        )
+
+    async def set_power_limit(
+        self,
+        mode: PowerLimitMode,
+        value: float,
+        expected_mode: PowerLimitMode,
+        expected_current_value: float,
+        expected_active_value: float,
+    ) -> PowerLimitChange:
+        return await self._set_power_limit(
+            mode, value, expected_mode, expected_current_value, expected_active_value, reassert=True
+        )
+
+    async def _set_power_limit(
+        self,
+        mode: PowerLimitMode,
+        value: float,
+        expected_mode: PowerLimitMode,
+        expected_current_value: float,
+        expected_active_value: float,
+        *,
+        reassert: bool,
+    ) -> PowerLimitChange:
         if not self.control_enabled:
             raise SolarControlError("Generation-cap control is disabled; set SOLAR_ALLOW_CONTROL=1 locally.")
-        requested = _percent_tenths(percent)
-        expected = _percent_tenths(expected_current_percent)
-        expected_active = expected if expected_active_percent is None else _percent_tenths(expected_active_percent)
+        requested = _limit_value(mode, value)
+        expected = _limit_value(expected_mode, expected_current_value)
+        expected_active = _limit_value(expected_mode, expected_active_value)
+        register = rn.ACTIVE_POWER_PERCENTAGE_DERATING if mode == "percent" else rn.ACTIVE_POWER_FIXED_VALUE_DERATING
         write_attempted = False
 
-        async def change(client: ReadClient) -> GenerationLimitChange:
+        async def change(client: ReadClient) -> PowerLimitChange:
             nonlocal write_attempted
             await self._verify_identity(client)
             previous = await self._read_generation_limit(client)
-            if previous.percent != expected / 10 or previous.active_percent != expected_active / 10:
+            if previous.mode != expected_mode or _limit_values(previous) != (expected, expected_active):
                 raise SolarControlError(
                     "The current cap differs from the expected value or active readback. "
                     "Read get_generation_limit again; no cap write was attempted."
                 )
-            if requested == expected:
-                return _change_result(previous.percent, previous, changed=False, request_id=None)
+            if not reassert and mode == previous.mode and requested == expected:
+                return _power_change_result(previous, mode, requested, previous, written=False, request_id=None)
+            if mode == "watts" and requested > await self._maximum_power(client):
+                raise SolarControlError("The requested watt cap exceeds the inverter's Pmax; no cap write was attempted.")
             if self._config.installer_password is not None:
                 if not await client.login("installer", self._config.installer_password):
                     raise SolarControlError("Installer login failed; no cap write was attempted.")
                 if not await client.heartbeat():
                     raise SolarControlError("Installer session heartbeat failed; no cap write was attempted.")
                 current = await self._read_generation_limit(client)
-                if current.percent != previous.percent or current.active_percent != previous.active_percent:
+                if current.mode != previous.mode or _limit_values(current) != _limit_values(previous):
                     raise SolarControlError("The cap changed during login; no cap write was attempted.")
+            previous_target = (
+                _limit_values(previous)[0] if mode == previous.mode
+                else _limit_value(mode, (await client.get(register)).value)
+            )
             request_id = str(uuid4())
             record: dict[str, object] = {
                 "request_id": request_id,
@@ -309,31 +403,44 @@ class HuaweiSolarReader:
                 "serial": self._config.expected_serial,
                 "previous_percent": previous.percent,
                 "previous_active_percent": previous.active_percent,
-                "requested_percent": requested / 10,
+                "requested_percent": requested if mode == "percent" else None,
+                "previous_mode": previous.mode,
+                "previous_value": _limit_values(previous)[0],
+                "previous_active_value": _limit_values(previous)[1],
+                "previous_target_value": previous_target,
+                "requested_mode": mode,
+                "requested_value": requested,
             }
             self._record_cap_event(record, "prepared")
             self._cache = None
             write_attempted = True
-            acknowledged = await client.set(rn.ACTIVE_POWER_PERCENTAGE_DERATING, requested / 10)
+            acknowledged = await client.set(register, requested)
             if not acknowledged:
                 raise SolarControlError("The inverter did not acknowledge the requested cap.")
             for attempt in range(3):
                 actual = await self._read_generation_limit(client)
-                if actual.percent == requested / 10 and actual.active_percent == requested / 10:
+                if actual.mode == mode and _limit_values(actual) == (requested, requested):
                     break
                 if attempt < 2:
                     await asyncio.sleep(0.25)
-            if actual.percent != requested / 10:
+            configured = (
+                _limit_values(actual)[0] if actual.mode == mode
+                else _limit_value(mode, (await client.get(register)).value)
+            )
+            if configured != requested:
                 raise SolarControlError("The configured cap did not match the request.")
+            active_matches = actual.mode == mode and _limit_values(actual)[1] == requested
             self._record_cap_event(
                 {
                     **record,
                     "active_percent": actual.active_percent,
-                    "active_readback_matches": actual.active_percent == actual.percent,
+                    "active_mode": actual.mode,
+                    "active_value": _limit_values(actual)[1],
+                    "active_readback_matches": active_matches,
                 },
                 "verified",
             )
-            return _change_result(previous.percent, actual, changed=True, request_id=request_id)
+            return _power_change_result(previous, mode, requested, actual, written=True, request_id=request_id)
 
         try:
             async with asyncio.timeout(REFRESH_TIMEOUT_SECONDS):

@@ -9,13 +9,14 @@ server never connects to or controls the inverter.
 
 A local stdio [Model Context Protocol](https://modelcontextprotocol.io/) server for
 Huawei SUN2000 inverter telemetry, **read-only by default**, with optional
-percentage generation-cap control.
+percentage and fixed-watt generation-cap control.
 
 | Tool | Availability | Purpose |
 |---|---|---|
 | `get_solar_status` | Always | Generation, energy counters, device status, and freshness |
-| `get_generation_limit` | Always | Fresh configured and active percentage-cap readbacks |
+| `get_generation_limit` | Always | Fresh mode-aware percentage or watt-cap readbacks |
 | `set_generation_limit` | Explicit local opt-in | Change the percentage power cap with expected-value and readback checks |
+| `set_power_limit` | Explicit local opt-in | Select a percentage or whole-watt cap, including guarded mode changes and restoration |
 
 Generation is **not** household consumption, grid export, or available surplus.
 There are no arbitrary-register, start/stop, grid-code, reactive-power, discovery,
@@ -30,9 +31,10 @@ for an explicit cap change when an installer password has been configured.
 - The inverter's unit ID. The verified SUN2000-8KTL-M0 / SDongleA-05 installation
   uses **unit 1**, not the library's unit-0 default.
 
-Telemetry, percentage-cap configuration writes, and restoration on that
-inverter/dongle combination have been exercised on hardware. Physical curtailment
-under sufficient sunlight has not yet been verified.
+Telemetry, percentage-cap writes/restoration, and fixed-watt writes/readbacks on
+that inverter/dongle combination have been exercised on hardware. On-grid output
+curtailment following a fixed-watt command has been observed; instantaneous power
+can fluctuate around the setting rather than equal it exactly.
 Other SUN2000 models must provide the same registers; missing data is an error rather
 than an invented reading. Software updates and commissioning are outside this
 server's scope. Do not start it during an active firmware update.
@@ -60,7 +62,7 @@ is a documentation placeholder, not a discoverable device.
 | `SOLAR_INVERTER_PORT` | `502` | Modbus TCP port |
 | `SOLAR_INVERTER_UNIT_ID` | `1` | Inverter unit, between 0 and 247 |
 | `SOLAR_EXPECTED_SERIAL` | Unset | Optional expected inverter serial; kept local and never returned by the tool |
-| `SOLAR_ALLOW_CONTROL` | `0` | Set exactly `1` to register the cap setter; requires `SOLAR_EXPECTED_SERIAL` |
+| `SOLAR_ALLOW_CONTROL` | `0` | Set exactly `1` to register the cap setters; requires `SOLAR_EXPECTED_SERIAL` |
 | `SOLAR_CONTROL_LOG` | `~/.local/state/solar-mcp/generation-caps.jsonl` | Private, durable cap-change journal; overrides must be absolute paths |
 | `SOLAR_INSTALLER_PASSWORD` | Unset | Optional local installer password, used only during an explicit cap change |
 
@@ -147,16 +149,19 @@ A cap limits instantaneous output **power** (W or kW), not daily **energy**
 for half an hour it generates 1 kWh. A cap cannot force more production than
 sunlight makes available and is not a household export limit.
 
-This release changes only the existing **percentage** mode, register `40125`.
-The percentage is the inverter's own power reference, not a kWh target. The
-server does not convert percentages into promised watts. It refuses to replace
-fixed-watt or other control modes, and does not change maximum hardware power.
+Supported controls are **percentage** mode at `40125` (0.1% steps) and
+**fixed-watt** mode at `40126` (one unsigned 32-bit value, 1 W steps). A percentage
+uses the inverter's own power reference; it is not converted into promised watts.
+Whole-watt targets must be between zero and the freshly read hardware **Pmax**
+at `30075`. The server does not change Pmax or override other scheduling modes.
+The active mode/value/command block at `35300`-`35303` is always read together.
 
-`get_generation_limit` has no arguments and never uses a cache. It returns
-`percent` (configured), `active_percent` (active adjustment readback),
-`observed_at` (UTC), and `control_enabled`. Unsupported modes and invalid
-register values are explicit errors. Configured and active values can differ;
-do not assume a stored cap has taken effect.
+`get_generation_limit` has no arguments and never uses a cache. Its `mode` is
+`percent` or `watts`; the corresponding configured/active fields are
+`percent`/`active_percent` or `watts`/`active_watts`. Fields in the other unit are
+`null`. Results also contain `observed_at` (UTC) and `control_enabled`.
+Unsupported mode/command combinations and invalid register values are explicit
+errors. A stored cap and its active adjustment can differ.
 
 ### Enable and use control
 
@@ -199,28 +204,68 @@ other inverter limits. A request for the already active value returns
 `changed: false` without writing or authenticating; it does not prove write
 permission.
 
-The setter serializes with reads, checks device identity again, rejects stale
-configured or active expectations, and durably saves the previous value and
-intent before sending one function-06 write to `40125` through the Huawei library.
-It checks the acknowledgment and configured cap before returning `changed: true`
-with `configuration_verified: true`. It also reads the active adjustment, up to
-three times, but **never automatically retries a cap write**.
+### Whole-watt caps and mode changes
+
+Use `set_power_limit` for a whole-watt cap or an explicit transition between the
+two supported modes. Read `get_generation_limit` first. Pass its `mode` as
+`expected_mode`, and both configured/active values in that mode's unit as
+`expected_current_value` and `expected_active_value`.
+
+For example, only when the fresh configured and active readbacks are both 100%
+and you actually want a 222 W maximum:
+
+```json
+{
+  "mode": "watts",
+  "value": 222,
+  "expected_mode": "percent",
+  "expected_current_value": 100,
+  "expected_active_value": 100
+}
+```
+
+Save the result's `previous` mode and value for restoration. To restore a previous
+100% cap after a fresh read confirms configured/active values of 222 W, call this
+same tool with `mode: "percent"`, `value: 100`, `expected_mode: "watts"`, and both
+expected values set to `222`. The original `set_generation_limit` remains a
+percentage-mode-only convenience; it will not implicitly switch out of watt mode.
+
+Unlike that convenience tool's no-op optimization, `set_power_limit` deliberately
+sends one command even when its target matches the visible state. This permits
+explicit reassertion/restoration when another mode's command is still pending.
+`write_performed: true` means the command was sent and its stored value verified.
+It does not promise constant generation or prove that physical curtailment has
+already occurred.
+
+### Verification and persistence
+
+Both setters share the same serialization, identity, fresh-expectation, optional
+installer-login, durable-journal, and readback safeguards. They send one named
+Huawei-library write: function 06 to `40125` for percentages, or function 16 with
+two words at `40126` for watts. No separate mode register is written. They check
+the acknowledgment and stored target, then inspect the active adjustment up to
+three times, but **never automatically retry a cap write**.
 
 `changed: true` means the **stored setting** changed, not that output is already
-limited. `active_readback_matches` reports whether the active adjustment agrees.
+limited. `active_readback_matches` reports whether the requested mode and active
+adjustment agree. For `set_power_limit`, `configuration_verified` refers to
+`requested_mode`/`requested_value`; `limit` still describes the active mode's
+readbacks, which may be the previous mode while a transition is pending.
 If it does not, the result includes a warning: the cap may be pending or overridden,
 and its output restriction is unconfirmed. This distinction is necessary because
 the two readbacks can differ while the inverter is in no-irradiation standby.
 Physical curtailment must be checked separately while sufficient sunlight exists.
-The hardware check changed the stored cap from 100% to 99% and restored 100%;
-the active readback stayed at 100% in standby. Both final readbacks were 100%.
+An earlier standby check changed the stored cap from 100% to 99% and restored
+100%, while the active readback stayed at 100%. A later on-grid fixed-watt check
+verified both configured/active watt values and observed output curtailment.
 
 **Treat changes as persistent.** Exiting or disconnecting does not trigger a
 restore. If a write times out, is cancelled, or fails verification, it may still
 have applied. Read the current cap before any further action; do not blindly
 retry or assume the original cap was restored. The private journal contains
-paired `prepared`/`verified` records, including previous/requested percentages,
-active readback, and a request ID. `verified` means the configured value was
+paired `prepared`/`verified` records, including previous/requested modes and values,
+the target register's previous value, active readback, and a request ID.
+`verified` means the configured value was
 verified; its `active_readback_matches` field records the separate active result.
 An unpaired `prepared` record has an uncertain outcome and
 preserves the information needed for an explicit recovery.
@@ -407,7 +452,8 @@ uv build
 
 Tests use fake clients and a loopback Modbus server, not physical hardware. The stdio integration tests exercise the actual SDK and Huawei library, verify
 schemas and errors, assert that default-mode traffic is only function-03 reads,
-and check the exact function-06 percentage words in opt-in mode. Tests also cover
+and check exact function-06 percentage and function-16 two-word watt writes in
+opt-in mode. Tests also cover Pmax bounds, guarded mode transitions/reassertion,
 identity and expected-value checks, durable intent, permission failures, explicit
 restoration with differing stored/active readbacks, cancellation, serialization,
 and unchanged monitoring behavior.

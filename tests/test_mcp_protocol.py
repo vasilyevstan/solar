@@ -23,8 +23,11 @@ class ModbusStub:
         self.fail_reads = False
         self.allow_writes = False
         self.update_active_on_write = True
+        self.write_words: list[tuple[int, tuple[int, ...]]] = []
         self.put_words(35300, [0, 0, 1000, 40125])
         self.put_words(40125, [1000])
+        self.put_words(40126, [0, 8800])
+        self.put_words(30075, [0, 8800])
         self.put_text(30000, 15, "SUN2000-8KTL-M0")
         self.put_text(30015, 10, "TEST-INVERTER-0001")
         self.put_text(30050, 15, "TEST-FIRMWARE")
@@ -49,15 +52,29 @@ class ModbusStub:
                 pdu = await reader.readexactly(length - 1)
                 function = pdu[0]
                 address, count = struct.unpack(">HH", pdu[1:]) if len(pdu) == 5 else (-1, -1)
+                if function == 16 and len(pdu) >= 6:
+                    address, count, byte_count = struct.unpack(">HHB", pdu[1:6])
+                    assert byte_count == count * 2 and len(pdu) == 6 + byte_count
                 self.requests.append((unit, function, address, count))
                 if function == 6 and address == 40125:
+                    self.write_words.append((address, (count,)))
                     if self.allow_writes:
                         self.put_words(40125, [count])
                         if self.update_active_on_write:
-                            self.put_words(35301, [0, count])
+                            self.put_words(35300, [0, 0, count, 40125])
                         response = pdu
                     else:
                         response = b"\x86\x80"
+                elif function == 16 and address == 40126 and count == 2:
+                    words = struct.unpack(">2H", pdu[6:])
+                    self.write_words.append((address, words))
+                    if self.allow_writes:
+                        self.put_words(40126, list(words))
+                        if self.update_active_on_write:
+                            self.put_words(35300, [1, *words, 40126])
+                        response = struct.pack(">BHH", 16, address, count)
+                    else:
+                        response = b"\x90\x80"
                 elif function != 3:
                     response = bytes([function | 0x80, 1])
                 elif self.fail_reads:
@@ -117,6 +134,12 @@ def test_stdio_tool_schema_live_cache_errors_and_read_only_wire_contract() -> No
                         "set_generation_limit", {"percent": 50, "expected_current_percent": 100}
                     )
                     assert forbidden.is_error
+                    forbidden_watts = await session.call_tool(
+                        "set_power_limit",
+                        {"mode": "watts", "value": 222, "expected_mode": "percent",
+                         "expected_current_value": 100, "expected_active_value": 100},
+                    )
+                    assert forbidden_watts.is_error
                     assert not stub.requests
                     limit = await session.call_tool("get_generation_limit", {})
                     assert not limit.is_error
@@ -242,7 +265,9 @@ def test_stdio_percentage_control_schema_precise_write_readback_restore_and_perm
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                    assert set(tools) == {"get_solar_status", "get_generation_limit", "set_generation_limit"}
+                    assert set(tools) == {
+                        "get_solar_status", "get_generation_limit", "set_generation_limit", "set_power_limit"
+                    }
                     setter = tools["set_generation_limit"]
                     assert not setter.annotations.read_only_hint
                     assert setter.annotations.destructive_hint
@@ -326,6 +351,70 @@ def test_stdio_mixed_active_readback_reports_warning_and_restores_explicitly(tmp
             (40125, 990), (40125, 1000)
         ]
 
+    asyncio.run(check())
+
+
+def test_stdio_fixed_watts_use_one_u32_write_and_can_restore_percentage_mode(tmp_path) -> None:
+    async def check():
+        stub = ModbusStub()
+        stub.allow_writes = True
+        async with stub.serve() as port:
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "solar_mcp.server", "--inverter-host", "127.0.0.1", "--inverter-port", str(port)],
+                env={
+                    "SOLAR_EXPECTED_SERIAL": "TEST-INVERTER-0001", "SOLAR_INVERTER_UNIT_ID": "1",
+                    "SOLAR_ALLOW_CONTROL": "1", "SOLAR_CONTROL_LOG": str(tmp_path / "watts.jsonl"),
+                },
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                    setter = tools["set_power_limit"]
+                    assert setter.annotations.destructive_hint and not setter.annotations.read_only_hint
+                    assert not setter.annotations.idempotent_hint
+                    arguments = {
+                        "mode": "watts", "value": 222, "expected_mode": "percent",
+                        "expected_current_value": 100, "expected_active_value": 100,
+                    }
+                    assert set(setter.input_schema["required"]) == set(arguments)
+                    for update in [{"value": 222.5}, {"value": True}, {"value": "222"}, {"mode": "kw"},
+                                   {"expected_mode": "watts", "expected_active_value": 222.5}]:
+                        invalid = await session.call_tool("set_power_limit", {**arguments, **update})
+                        assert invalid.is_error
+                    assert not stub.requests
+                    excessive = await session.call_tool("set_power_limit", {**arguments, "value": 8801})
+                    assert excessive.is_error and not stub.write_words
+                    result = await session.call_tool("set_power_limit", arguments)
+                    assert not result.is_error, str(result.content)
+                    data = result.structured_content
+                    assert data["requested_mode"] == "watts" and data["requested_value"] == 222
+                    assert data["write_performed"] and data["configuration_verified"] and data["active_readback_matches"]
+                    assert data["previous"]["mode"] == "percent" and data["previous"]["percent"] == 100
+                    assert data["limit"]["mode"] == "watts"
+                    assert data["limit"]["watts"] == data["limit"]["active_watts"] == 222
+                    assert data["limit"]["percent"] is data["limit"]["active_percent"] is None
+                    assert stub.write_words == [(40126, (0, 222))]
+                    fresh = await session.call_tool("get_generation_limit", {})
+                    assert not fresh.is_error and fresh.structured_content["watts"] == 222
+                    legacy = await session.call_tool("set_generation_limit", {"percent": 100, "expected_current_percent": 100})
+                    assert legacy.is_error and len(stub.write_words) == 1
+                    restored = await session.call_tool("set_power_limit", {
+                        "mode": "percent", "value": 100, "expected_mode": "watts",
+                        "expected_current_value": 222, "expected_active_value": 222,
+                    })
+                    assert not restored.is_error, str(restored.content)
+                    assert restored.structured_content["limit"]["percent"] == 100
+                    stub.allow_writes = False
+                    denied = await session.call_tool("set_power_limit", arguments)
+                    assert denied.is_error and "denied write permission" in str(denied.content)
+        assert stub.write_words == [(40126, (0, 222)), (40125, (1000,)), (40126, (0, 222))]
+        assert [(function, address, count) for _, function, address, count in stub.requests if function != 3] == [
+            (16, 40126, 2), (6, 40125, 1000), (16, 40126, 2),
+        ]
+        assert all(unit == 1 and function in {3, 6, 16} for unit, function, _, _ in stub.requests)
+        assert all(count == 4 for _, function, address, count in stub.requests if function == 3 and address == 35300)
     asyncio.run(check())
 
 

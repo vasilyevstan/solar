@@ -11,7 +11,7 @@ from huawei_solar.registers import REGISTERS
 
 from solar_mcp import reader as reader_module
 from solar_mcp.models import GenerationLimitChange
-from solar_mcp.reader import HuaweiConfig, HuaweiSolarReader, SolarControlError, _percent_tenths
+from solar_mcp.reader import HuaweiConfig, HuaweiSolarReader, SolarControlError, _percent_tenths, _watts
 from test_reader import FakeClient
 
 
@@ -24,6 +24,8 @@ class CapClient(FakeClient):
                 rn.ACTIVE_POWER_ADJUSTMENT_MODE: 0,
                 rn.ACTIVE_POWER_ADJUSTMENT_VALUE: 1000,
                 rn.ACTIVE_POWER_ADJUSTMENT_COMMAND: 40125,
+                rn.ACTIVE_POWER_FIXED_VALUE_DERATING: 8800,
+                rn.P_MAX: 8800,
             }
         )
         self.writes: list[tuple[int, int]] = []
@@ -38,21 +40,24 @@ class CapClient(FakeClient):
         self.write_started = asyncio.Event()
         self.log_path: Path | None = None
 
-    async def set(self, name: rn.RegisterName, percent: float) -> bool:
-        assert name == rn.ACTIVE_POWER_PERCENTAGE_DERATING
-        address, value = 40125, _percent_tenths(percent)
+    async def set(self, name: rn.RegisterName, requested: float) -> bool:
+        assert name in {rn.ACTIVE_POWER_PERCENTAGE_DERATING, rn.ACTIVE_POWER_FIXED_VALUE_DERATING}
+        percentage = name == rn.ACTIVE_POWER_PERCENTAGE_DERATING
+        address, value = (40125, _percent_tenths(requested)) if percentage else (40126, _watts(requested))
         if self.log_path is not None:
             record = json.loads(self.log_path.read_text().splitlines()[-1])
             assert record["event"] == "prepared"
-            assert record["requested_percent"] == value / 10
+            assert record["requested_value"] == (value / 10 if percentage else value)
         self.writes.append((address, value))
         self.write_started.set()
         if self.write_error is not None:
             raise self.write_error
         if self.apply_write:
-            self.values[rn.ACTIVE_POWER_PERCENTAGE_DERATING] = value / 10
+            self.values[name] = value / 10 if percentage else value
             if self.update_active:
+                self.values[rn.ACTIVE_POWER_ADJUSTMENT_MODE] = 0 if percentage else 1
                 self.values[rn.ACTIVE_POWER_ADJUSTMENT_VALUE] = value
+                self.values[rn.ACTIVE_POWER_ADJUSTMENT_COMMAND] = address
         await asyncio.sleep(self.write_delay)
         return True
 

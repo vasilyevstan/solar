@@ -14,11 +14,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .models import GenerationLimit, GenerationLimitChange, SolarSnapshot
+from .models import GenerationLimit, GenerationLimitChange, PowerLimitChange, PowerLimitMode, SolarSnapshot
 from .reader import HuaweiConfig, HuaweiSolarReader, SolarControlError, SolarReadError
 
 LOGGER = logging.getLogger(__name__)
 Percentage = Annotated[float, Field(strict=True, ge=0, le=100, multiple_of=0.1)]
+PowerValue = Annotated[float, Field(strict=True, ge=0, lt=0xFFFFFFFF)]
 
 
 def create_server(reader: HuaweiSolarReader) -> MCPServer[None]:
@@ -40,8 +41,9 @@ def create_server(reader: HuaweiSolarReader) -> MCPServer[None]:
             + (
                 "Only change the cap for an explicit user request. Read the current cap first. "
                 "Changes can persist after shutdown; never assume an error means the old cap remains. "
-                "Configured and active percentages can differ; never claim an active cap from stored configuration alone. "
-                "Restore a saved previous percentage with the same setter and fresh configured/active expectations."
+                "Configured and active caps or modes can differ; never claim an active cap from stored configuration alone. "
+                "Use set_power_limit for whole-watt caps or explicit mode changes, with fresh mode/value expectations. "
+                "A cap is a maximum, not a guarantee of constant output. Restore the saved previous mode/value explicitly."
                 if reader.control_enabled
                 else "Control is disabled; no write tools are available."
             )
@@ -70,7 +72,11 @@ def create_server(reader: HuaweiSolarReader) -> MCPServer[None]:
         )
     )
     async def get_generation_limit() -> GenerationLimit:
-        """Read the configured and active percentage power cap without caching or changing it."""
+        """Read the active cap mode and its configured/active values without caching or changing it.
+
+        mode='percent' returns percent/active_percent; mode='watts' returns watts/active_watts.
+        Values in the other unit are null. Other control modes are rejected, not overwritten.
+        """
         try:
             return await reader.get_generation_limit()
         except SolarControlError as error:
@@ -101,6 +107,38 @@ def create_server(reader: HuaweiSolarReader) -> MCPServer[None]:
             try:
                 return await reader.set_generation_limit(
                     percent, expected_current_percent, expected_active_percent
+                )
+            except SolarControlError as error:
+                LOGGER.warning("%s", error)
+                raise ToolError(str(error)) from None
+
+        @server.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+            )
+        )
+        async def set_power_limit(
+            mode: PowerLimitMode,
+            value: PowerValue,
+            expected_mode: PowerLimitMode,
+            expected_current_value: PowerValue,
+            expected_active_value: PowerValue,
+        ) -> PowerLimitChange:
+            """Explicitly select a percentage or fixed-watt generation cap, including switching modes.
+
+            Read get_generation_limit first. Match expected_mode and both values in that mode's
+            unit: percent/active_percent or watts/active_watts. Percent is 0-100 in 0.1 steps;
+            watts must be whole watts from 0 through the freshly read hardware Pmax.
+            This sends one journaled command even when the values appear unchanged, allowing
+            explicit restoration/reassertion after a pending mode change. No blind write retries.
+            configuration_verified verifies the requested register; limit describes the active
+            mode's readbacks. Check active_readback_matches before claiming the cap is active.
+            Save previous for restoration with this tool and fresh expectations. Caps persist
+            after disconnect; zero can stop generation. This is not a grid-export target.
+            """
+            try:
+                return await reader.set_power_limit(
+                    mode, value, expected_mode, expected_current_value, expected_active_value
                 )
             except SolarControlError as error:
                 LOGGER.warning("%s", error)
