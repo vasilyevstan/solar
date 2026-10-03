@@ -62,7 +62,7 @@ class FakeActions(GitHubActionsSource):
         if path == "user":
             return {"login": "caller"}
         if path == f"{root}/actions/workflows/solar-stats.yml":
-            return {"id": 11, "path": ".github/workflows/solar-stats.yml", "state": "active"}
+            return {"id": 11, "path": ".github/workflows/solar-stats.yml", "state": "active", "name": "Report job"}
         if path == f"{root}/git/ref/heads/main":
             return {"object": {"sha": WORKFLOW_SHA}}
         if path.endswith("/dispatches"):
@@ -186,6 +186,32 @@ def test_timeout_does_not_cancel_a_later_rerun(monkeypatch):
     with pytest.raises(StatsError, match="timed out"):
         asyncio.run(source.fetch(DateRange.parse("2025-01-01")))
     assert not any(path.endswith("/cancel") for _, path, _ in source.calls)
+
+
+def test_newly_queued_run_waits_for_its_request_name_before_adoption(monkeypatch):
+    class PendingTitle(FakeActions):
+        reads = 0
+        async def _api(self, method, path, payload=None):
+            result = await super()._api(method, path, payload)
+            if path.endswith("/actions/runs/42"):
+                self.reads += 1
+                if self.reads == 1:
+                    return {**result, "status": "queued", "display_title": "Report job"}
+            return result
+    source = PendingTitle()
+    monkeypatch.setattr(actions, "POLL_SECONDS", 0)
+    assert asyncio.run(source.fetch(DateRange.parse("2025-01-01"))).generation_kwh == 1.125
+    assert source.reads == 2
+
+
+def test_unresolved_title_does_not_authorize_cancelling_a_run(monkeypatch):
+    source = FakeActions()
+    source.run.update(status="queued", display_title="Report job")
+    source.timeout_seconds = 0.02
+    monkeypatch.setattr(actions, "POLL_SECONDS", 10)
+    with pytest.raises(StatsError, match="timed out"):
+        asyncio.run(source.fetch(DateRange.parse("2025-01-01")))
+    assert not any(path.endswith("/cancel") or path.endswith("/zip") for _, path, _ in source.calls)
 
 
 def test_gh_errors_do_not_reveal_captured_output(monkeypatch):

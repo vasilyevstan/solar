@@ -163,14 +163,19 @@ class GitHubActionsSource:
         ):
             raise StatsError("actions_invalid_result", "The report does not match the requested plant and dates.")
 
-    def _owns_run(self, run: dict, request_id: str, actor: str, workflow_id: int, workflow_sha: str) -> bool:
+    def _same_dispatch(self, run: dict, actor: str, workflow_id: int, workflow_sha: str) -> bool:
         author, repository = run.get("actor"), run.get("repository")
         return (
-            run.get("display_title") == f"solar-stats:{request_id}"
-            and run.get("head_sha") == workflow_sha and run.get("workflow_id") == workflow_id
+            run.get("head_sha") == workflow_sha and run.get("workflow_id") == workflow_id
             and run.get("event") == "workflow_dispatch" and run.get("run_attempt") == 1
             and isinstance(author, dict) and author.get("login") == actor
             and isinstance(repository, dict) and repository.get("full_name") == self.config.repository
+        )
+
+    def _owns_run(self, run: dict, request_id: str, actor: str, workflow_id: int, workflow_sha: str) -> bool:
+        return (
+            run.get("display_title") == f"solar-stats:{request_id}"
+            and self._same_dispatch(run, actor, workflow_id, workflow_sha)
         )
 
     async def _request(self, interval: DateRange, granularity: Literal["day", "hour"]) -> dict:
@@ -206,6 +211,14 @@ class GitHubActionsSource:
                     run = await self._api("GET", f"{root}/actions/runs/{run_id}")
                     owned = self._owns_run(run, request_id, actor, workflow["id"], workflow_sha)
                     if not owned:
+                        # GitHub initially publishes the workflow name before resolving run-name inputs.
+                        if (
+                            run.get("status") in {"queued", "requested"}
+                            and run.get("display_title") == workflow.get("name")
+                            and self._same_dispatch(run, actor, workflow["id"], workflow_sha)
+                        ):
+                            await asyncio.sleep(POLL_SECONDS)
+                            continue
                         raise StatsError("actions_ownership_mismatch", "The workflow run does not match this caller/request/revision.")
                     if run.get("status") == "completed":
                         completed = True
