@@ -324,6 +324,9 @@ class FusionSolarSource:
                     'iframe[src*="captcha"]', '[id*="captcha" i]'];
                 if (challenge.some(selector => [...document.querySelectorAll(selector)].some(visible)))
                     return 'challenge';
+                if (/^#\\/view\\/station\\/NE=\\d+\\/overview$/.test(location.hash)
+                    && visible(document.querySelector('.nco-single-energy-lifetime-button')))
+                    return 'overview';
                 if (afterLogin) {
                     const error = document.querySelector('#errorMessage');
                     if (visible(error) && error.textContent.trim()) return 'rejected';
@@ -334,7 +337,7 @@ class FusionSolarSource:
         )
         try:
             state = await result.json_value()
-            if not isinstance(state, str) or state not in {"report", "application", "login", "challenge", "rejected"}:
+            if not isinstance(state, str) or state not in {"report", "application", "overview", "login", "challenge", "rejected"}:
                 raise StatsError("portal_changed", "The browser returned an unrecognized authentication state.")
             return state
         finally:
@@ -356,6 +359,17 @@ class FusionSolarSource:
             original.cancel()
             await asyncio.gather(original, return_exceptions=True)
 
+    async def _follow_report_landing(self, page: Page, state: str) -> str:
+        # A fresh application's initial redirect can supersede the first report navigation.
+        for landing in ("application", "overview"):
+            if state != landing:
+                continue
+            if state == "overview":
+                self._check_plant(page)
+            await page.goto(self.config.application_report_url(page.url), wait_until="domcontentloaded")
+            state = await self._portal_state(page)
+        return state
+
     async def _ensure_report(self, page: Page) -> Page:
         try:
             state = await self._portal_state(page)
@@ -369,9 +383,7 @@ class FusionSolarSource:
             LOGGER.warning("The restored portal tab is blank; reopening the normal regional sign-in page once.")
             await page.goto(self.config.login_url, wait_until="domcontentloaded")
             state = await self._portal_state(page)
-        if state == "application":
-            await page.goto(self.config.application_report_url(page.url), wait_until="domcontentloaded")
-            state = await self._portal_state(page)
+        state = await self._follow_report_landing(page, state)
         if state == "report":
             self._check_plant(page)
             return page
@@ -406,9 +418,7 @@ class FusionSolarSource:
             self._check_login_origin(page)
             await page.locator("#submitDataverify").click()
             destination, state = await self._login_destination(page, popup)
-            if state == "application":
-                await destination.goto(self.config.application_report_url(destination.url), wait_until="domcontentloaded")
-                state = await self._portal_state(destination)
+            state = await self._follow_report_landing(destination, state)
             if state != "report":
                 raise StatsError(
                     "authentication_required",

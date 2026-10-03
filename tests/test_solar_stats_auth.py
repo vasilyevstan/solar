@@ -186,6 +186,88 @@ def test_authenticated_home_landing_opens_configured_report_without_keychain(tmp
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("states", [
+    ["overview", "report"],
+    ["application", "overview", "report"],
+])
+def test_authenticated_overview_landing_follows_report_without_credentials(tmp_path, monkeypatch, states) -> None:
+    async def check():
+        source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE))
+        page = MagicMock(url=PLANT_URL, goto=AsyncMock())
+        remaining = iter(states)
+        async def portal_state(candidate, *, after_login=False):
+            state = next(remaining)
+            candidate.url = (
+                PLANT_URL.replace("/view/station/NE=123456/report", "/home/list")
+                if state == "application" else PLANT_URL.removesuffix("report") + state
+            )
+            return state
+        monkeypatch.setattr(source, "_portal_state", portal_state)
+        credentials = AsyncMock()
+        monkeypatch.setattr("solar_stats.browser.keychain_credentials", credentials)
+        assert await source._ensure_report(page) is page
+        assert page.goto.await_count == len(states) - 1
+        assert all(call.args == (PLANT_URL,) for call in page.goto.await_args_list)
+        credentials.assert_not_called()
+    asyncio.run(check())
+
+
+def test_environment_login_follows_bootstrap_overview_without_resubmitting(tmp_path, monkeypatch) -> None:
+    async def check():
+        source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, login_source="environment"))
+        page = MagicMock(url=LOGIN_URL, goto=AsyncMock())
+        page.locator.return_value.fill = AsyncMock()
+        page.locator.return_value.click = AsyncMock()
+        states = iter(["login", "application", "overview", "report"])
+        async def portal_state(candidate, *, after_login=False):
+            state = next(states)
+            if state == "application":
+                candidate.url = PLANT_URL.replace("/view/station/NE=123456/report", "/home/list")
+            elif state in {"overview", "report"}:
+                candidate.url = PLANT_URL.removesuffix("report") + state
+            return state
+        monkeypatch.setattr(source, "_portal_state", portal_state)
+        credentials = MagicMock(return_value=Credentials("synthetic-account", "synthetic-password"))
+        monkeypatch.setattr("solar_stats.browser.environment_credentials", credentials)
+        assert await source._ensure_report(page) is page
+        assert page.goto.await_count == 2
+        assert all(call.args == (PLANT_URL,) for call in page.goto.await_args_list)
+        credentials.assert_called_once_with()
+        assert page.locator.return_value.fill.await_count == 2
+        page.locator.return_value.click.assert_awaited_once()
+    asyncio.run(check())
+
+
+def test_another_plant_overview_is_not_followed(tmp_path, monkeypatch) -> None:
+    source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE))
+    page = MagicMock(url=PLANT_URL.replace("NE=123456/report", "NE=654321/overview"), goto=AsyncMock())
+    monkeypatch.setattr(source, "_portal_state", AsyncMock(return_value="overview"))
+    credentials = AsyncMock()
+    monkeypatch.setattr("solar_stats.browser.keychain_credentials", credentials)
+    with pytest.raises(StatsError, match="not the configured plant"):
+        asyncio.run(source._ensure_report(page))
+    page.goto.assert_not_called()
+    credentials.assert_not_called()
+
+
+@pytest.mark.parametrize("states", [
+    ["application", "application"],
+    ["application", "overview", "overview"],
+    ["overview", "overview"],
+])
+def test_report_landing_transitions_are_bounded(tmp_path, monkeypatch, states) -> None:
+    source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, keychain_service=SERVICE))
+    page = MagicMock(url=PLANT_URL, goto=AsyncMock())
+    monkeypatch.setattr(source, "_portal_state", AsyncMock(side_effect=states))
+    credentials = AsyncMock()
+    monkeypatch.setattr("solar_stats.browser.keychain_credentials", credentials)
+    with pytest.raises(StatsError, match="report is not available"):
+        asyncio.run(source._ensure_report(page))
+    assert page.goto.await_count == len(states) - 1
+    credentials.assert_not_called()
+    page.locator.assert_not_called()
+
+
 def test_report_matches_the_action_request_not_an_older_response(tmp_path) -> None:
     async def check():
         source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path))

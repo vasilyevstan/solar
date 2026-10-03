@@ -392,6 +392,10 @@ Inside the runner only, `SOLAR_STATS_LOGIN_SOURCE=environment` selects
 `SOLAR_STATS_USERNAME` and `SOLAR_STATS_PASSWORD` injected from the secrets.
 Missing credentials fail before opening Chrome. The same login-origin checks,
 single-attempt authentication and disabled browser-debug logging apply.
+Fresh sign-ins can first land on the plant overview while the application
+initializes. The client waits for that overview to be ready and follows the
+configured plant's report route without repeating login or dismissing unrelated
+dialogs.
 
 ### Browser-session setup
 
