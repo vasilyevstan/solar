@@ -1,0 +1,76 @@
+name: Solar stats request
+run-name: solar-stats:${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        required: true
+        type: string
+      start_date:
+        required: true
+        type: string
+      end_date:
+        required: true
+        type: string
+      granularity:
+        required: true
+        type: choice
+        options: [day, hour]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: solar-stats-portal
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    if: github.event.repository.private == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: vasilyevstan/solar
+          ref: "__SOLAR_SOURCE_SHA__"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.19"
+          python-version: "3.12"
+          enable-cache: false
+      - run: uv sync --frozen --no-dev
+      - name: Ensure Chrome is available
+        run: |
+          if ! command -v google-chrome >/dev/null; then
+            uv run --no-sync playwright install --with-deps chrome
+          fi
+      - name: Read the requested report
+        id: query
+        env:
+          SOLAR_STATS_BACKEND: browser
+          SOLAR_STATS_LOGIN_SOURCE: environment
+          SOLAR_STATS_BROWSER_MODE: managed
+          SOLAR_STATS_HEADLESS: "true"
+          SOLAR_STATS_TIMEOUT_SECONDS: "300"
+          SOLAR_STATS_PROFILE_DIR: ${{ runner.temp }}/solar-stats-browser
+          SOLAR_STATS_DATA_DIR: ${{ runner.temp }}/solar-stats-data
+          SOLAR_STATS_PLANT_URL: ${{ secrets.SOLAR_STATS_PLANT_URL }}
+          SOLAR_STATS_TIMEZONE: ${{ secrets.SOLAR_STATS_TIMEZONE }}
+          SOLAR_STATS_USERNAME: ${{ secrets.FUSIONSOLAR_USERNAME }}
+          SOLAR_STATS_PASSWORD: ${{ secrets.FUSIONSOLAR_PASSWORD }}
+          SOLAR_STATS_REQUEST_ID: ${{ inputs.request_id }}
+          SOLAR_STATS_START_DATE: ${{ inputs.start_date }}
+          SOLAR_STATS_END_DATE: ${{ inputs.end_date }}
+          SOLAR_STATS_GRANULARITY: ${{ inputs.granularity }}
+          SOLAR_STATS_SOURCE_SHA: "__SOLAR_SOURCE_SHA__"
+        run: uv run --no-sync python -m solar_stats.actions_runner
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.query.outcome != 'skipped'
+        with:
+          name: solar-stats-${{ inputs.request_id }}
+          path: ${{ runner.temp }}/solar-stats-result/report.json
+          if-no-files-found: error
+          retention-days: 1

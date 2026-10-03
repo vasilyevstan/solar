@@ -17,6 +17,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
+from .actions import ActionsConfig, GitHubActionsSource
 from .browser import FusionSolarSource, StatsConfig
 from .hourly import HourlyReport, StoredHourlySource, hourly_csv, hourly_metadata, save_hourly_years
 from .models import DateRange, GenerationReport, StatsError
@@ -152,11 +153,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s: %(message)s")
     try:
         config = StatsConfig.from_environment()
+        portal = (
+            GitHubActionsSource(ActionsConfig.from_environment(), config.plant_id, config.time_zone, config.timeout_seconds)
+            if config.backend == "github_actions" else FusionSolarSource(config)
+        )
         source = StoredGenerationSource(
-            FusionSolarSource(config), config.plant_id, config.data_dir, config.timeout_seconds
+            portal, config.plant_id, config.data_dir, config.timeout_seconds
         )
         hourly_source = StoredHourlySource(
-            FusionSolarSource(config), config.plant_id, config.data_dir, config.time_zone, config.timeout_seconds
+            portal, config.plant_id, config.data_dir, config.time_zone, config.timeout_seconds
         )
         if args.command == "query":
             interval = DateRange.parse(args.start_date, args.end_date)

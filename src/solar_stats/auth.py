@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -13,6 +14,17 @@ from .models import StatsError
 class Credentials:
     username: str = field(repr=False)
     password: str = field(repr=False)
+
+
+def environment_credentials() -> Credentials:
+    username = os.environ.get("SOLAR_STATS_USERNAME", "")
+    password = os.environ.get("SOLAR_STATS_PASSWORD", "")
+    if not username.strip() or not password:
+        raise StatsError(
+            "invalid_credentials",
+            "Configure both FUSIONSOLAR_USERNAME and FUSIONSOLAR_PASSWORD secrets for the Actions runner.",
+        )
+    return Credentials(username, password)
 
 
 async def _keychain_output(service: str, *, password: bool = False) -> str:

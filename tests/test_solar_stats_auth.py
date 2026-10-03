@@ -322,7 +322,7 @@ def test_login_follows_only_its_own_popup_and_cleans_up_failures(tmp_path, monke
 @pytest.mark.parametrize("fails", [False, True])
 def test_managed_browser_headless_start_and_cleanup(tmp_path, fails) -> None:
     async def check():
-        source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, browser_mode="managed"))
+        source = FusionSolarSource(StatsConfig(PLANT_URL, tmp_path, browser_mode="managed", time_zone="Europe/Helsinki"))
         context = MagicMock(close=AsyncMock())
         driver = MagicMock()
         driver.chromium.launch_persistent_context = AsyncMock(return_value=context)
@@ -336,6 +336,7 @@ def test_managed_browser_headless_start_and_cleanup(tmp_path, fails) -> None:
                 assert actual is context
         options = driver.chromium.launch_persistent_context.call_args.kwargs
         assert options["headless"] is True and options["channel"] == "chrome"
+        assert options["timezone_id"] == "Europe/Helsinki"
         assert not any("remote-debugging-port" in arg for arg in options["args"])
         context.close.assert_awaited_once()
     asyncio.run(check())

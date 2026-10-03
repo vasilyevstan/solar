@@ -334,6 +334,65 @@ measurements when an older cached result overlaps. Appends must cover intervenin
 dates rather than inventing values for unqueried gaps. Coordinated reads/writes
 use a local file lock. All plant data remains private and untracked.
 
+### GitHub Secrets and private Actions fetching
+
+For a local MCP that must not read the FusionSolar password from macOS Keychain,
+set `SOLAR_STATS_BACKEND=github_actions`. Saved-file hits remain entirely local.
+Uncovered dates are fetched by a dispatch-only job in a **private** GitHub
+repository; the local process never downloads the login credentials.
+
+Copy `automation/solar-stats.yml` into `.github/workflows/solar-stats.yml` in the
+private automation repository. Replace both `__SOLAR_SOURCE_SHA__` placeholders
+with the reviewed, published 40-character source commit. The workflow checks out
+that exact revision, uses pinned actions, has read-only repository permissions,
+and accepts only dates, daily/hourly granularity and a request ID. Do not enable
+this data-producing workflow in the public source repository.
+
+Create these repository **Actions secrets** through GitHub's secret forms or
+`gh secret set`'s private input prompt:
+
+| Secret | Value |
+|---|---|
+| `FUSIONSOLAR_USERNAME` | The FusionSolar login account |
+| `FUSIONSOLAR_PASSWORD` | The FusionSolar password, **not** the Mac/Keychain unlock password |
+| `SOLAR_STATS_PLANT_URL` | The configured plant page, without query parameters or tokens |
+| `SOLAR_STATS_TIMEZONE` | The plant report's IANA time zone |
+
+Configure the local MCP's existing private environment:
+
+```sh
+SOLAR_STATS_BACKEND=github_actions
+SOLAR_STATS_ACTIONS_REPOSITORY=your-owner/private-solar-runner
+SOLAR_STATS_ACTIONS_SOURCE_SHA=the-published-40-character-source-commit
+SOLAR_STATS_GH_COMMAND=/absolute/path/to/gh
+SOLAR_STATS_TIMEOUT_SECONDS=600
+```
+
+Keep the existing plant URL, time zone and data directory for local file
+validation. `gh` must already be authenticated to GitHub with access to dispatch
+Actions, read private artifacts and delete consumed artifacts in that repository.
+The browser-profile setting is optional and unused by this backend. No FusionSolar
+password is stored in local configuration, and no Keychain fallback is attempted.
+
+The local client verifies repository privacy, workflow revision, caller/run
+ownership, unique request ID, artifact digest, pinned source revision and report
+shape. Reports travel as private artifacts, are deleted after consumption, and
+otherwise expire after one day. Browser profiles and login state are never
+uploaded. Artifacts are temporary transport, not the permanent data-storage
+solution; CSV output and explicit yearly append behavior remain unchanged.
+
+Each live miss uses GitHub Actions runner time; file hits do not. Concurrent
+portal jobs are serialized, and cancellations/timeouts remain explicit failures.
+Update the workflow's source pin and local `SOLAR_STATS_ACTIONS_SOURCE_SHA`
+together when deploying new source. GitHub Secrets removes the Keychain prompt
+from portal fetching, but cannot bypass FusionSolar MFA, CAPTCHA, denied access,
+or missing historical measurements.
+
+Inside the runner only, `SOLAR_STATS_LOGIN_SOURCE=environment` selects
+`SOLAR_STATS_USERNAME` and `SOLAR_STATS_PASSWORD` injected from the secrets.
+Missing credentials fail before opening Chrome. The same login-origin checks,
+single-attempt authentication and disabled browser-debug logging apply.
+
 ### Browser-session setup
 
 Two browser modes are available. The default **`attach`** mode preserves existing

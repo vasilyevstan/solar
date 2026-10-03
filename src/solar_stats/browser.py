@@ -19,7 +19,7 @@ from playwright.async_api import Error as BrowserError
 from playwright.async_api import TimeoutError as BrowserTimeoutError
 from playwright.async_api import BrowserContext, Page, Playwright, Request, async_playwright
 
-from .auth import keychain_credentials
+from .auth import environment_credentials, keychain_credentials
 from .hourly import HourlyDay, HourlyReport, hour_slots, hourly_days_from_values, make_hourly_report, parse_hourly_rows, report_zone
 from .models import DateRange, GenerationReport, StatsError, make_report, parse_month_rows
 
@@ -45,13 +45,15 @@ def plant_from_url(url: str) -> str | None:
 @dataclass(frozen=True)
 class StatsConfig:
     plant_url: str
-    profile_dir: Path
+    profile_dir: Path | None
     timeout_seconds: float = 300
     browser_mode: Literal["attach", "managed"] = "attach"
     headless: bool = True
     keychain_service: str | None = None
     data_dir: Path = field(default_factory=lambda: Path("state/solar-stats").resolve())
     time_zone: str | None = None
+    login_source: Literal["keychain", "environment"] | None = None
+    backend: Literal["browser", "github_actions"] = "browser"
 
     def __post_init__(self) -> None:
         try:
@@ -61,7 +63,9 @@ class StatsConfig:
             raise StatsError("invalid_config", "SOLAR_STATS_PLANT_URL is not a valid URL.") from None
         if not valid or parsed.query or "?" in parsed.fragment:
             raise StatsError("invalid_config", "Set SOLAR_STATS_PLANT_URL to the plant page without query parameters.")
-        if not self.profile_dir.is_absolute():
+        if self.profile_dir is None and self.backend == "browser":
+            raise StatsError("invalid_config", "Browser fetching requires SOLAR_STATS_PROFILE_DIR.")
+        if self.profile_dir is not None and not self.profile_dir.is_absolute():
             raise StatsError("invalid_config", "SOLAR_STATS_PROFILE_DIR must be an absolute dedicated-profile path.")
         if not self.data_dir.is_absolute():
             raise StatsError("invalid_config", "SOLAR_STATS_DATA_DIR must be an absolute directory path.")
@@ -75,6 +79,16 @@ class StatsConfig:
             not self.keychain_service.strip() or any(ord(char) < 32 for char in self.keychain_service)
         ):
             raise StatsError("invalid_config", "SOLAR_STATS_KEYCHAIN_SERVICE must be a nonempty Keychain item name.")
+        if self.login_source not in {None, "keychain", "environment"} or self.backend not in {"browser", "github_actions"}:
+            raise StatsError("invalid_config", "Unsupported login source or portal backend.")
+        if self.login_source == "environment" and self.keychain_service:
+            raise StatsError("invalid_config", "Choose environment credentials or Keychain, not both.")
+        if self.login_source == "keychain" and not self.keychain_service:
+            raise StatsError("invalid_config", "Keychain login needs SOLAR_STATS_KEYCHAIN_SERVICE.")
+
+    @property
+    def has_credentials(self) -> bool:
+        return self.login_source == "environment" or bool(self.keychain_service)
 
     @property
     def plant_id(self) -> str:
@@ -140,7 +154,8 @@ class StatsConfig:
     def from_environment(cls) -> StatsConfig:
         url = os.environ.get("SOLAR_STATS_PLANT_URL", "")
         profile = os.environ.get("SOLAR_STATS_PROFILE_DIR", "")
-        if not url or not profile:
+        backend = os.environ.get("SOLAR_STATS_BACKEND", "browser")
+        if not url or (not profile and backend != "github_actions"):
             raise StatsError("invalid_config", "Set SOLAR_STATS_PLANT_URL and SOLAR_STATS_PROFILE_DIR locally.")
         try:
             timeout = float(os.environ.get("SOLAR_STATS_TIMEOUT_SECONDS", "300"))
@@ -150,11 +165,16 @@ class StatsConfig:
         headless = os.environ.get("SOLAR_STATS_HEADLESS", "true")
         if mode not in {"attach", "managed"} or headless not in {"true", "false"}:
             raise StatsError("invalid_config", "Use browser mode attach/managed and headless true/false.")
+        login_source = os.environ.get("SOLAR_STATS_LOGIN_SOURCE")
+        if login_source not in {None, "keychain", "environment"} or backend not in {"browser", "github_actions"}:
+            raise StatsError("invalid_config", "Unsupported SOLAR_STATS_LOGIN_SOURCE or SOLAR_STATS_BACKEND.")
         return cls(
-            url, Path(profile).expanduser(), timeout, "attach" if mode == "attach" else "managed", headless == "true",
+            url, Path(profile).expanduser() if profile else None, timeout, "attach" if mode == "attach" else "managed", headless == "true",
             os.environ.get("SOLAR_STATS_KEYCHAIN_SERVICE"),
             Path(os.environ.get("SOLAR_STATS_DATA_DIR", "state/solar-stats")).expanduser().resolve(),
             os.environ.get("SOLAR_STATS_TIMEZONE"),
+            "environment" if login_source == "environment" else "keychain" if login_source == "keychain" else None,
+            "github_actions" if backend == "github_actions" else "browser",
         )
 
 
@@ -225,7 +245,10 @@ def debugging_port(profile: Path) -> int:
 
 class FusionSolarSource:
     def __init__(self, config: StatsConfig) -> None:
+        if config.profile_dir is None:
+            raise StatsError("invalid_config", "Browser fetching requires a dedicated profile.")
         self.config = config
+        self.profile_dir = config.profile_dir
         self._lock = asyncio.Lock()
 
     async def fetch(self, interval: DateRange) -> GenerationReport:
@@ -238,14 +261,14 @@ class FusionSolarSource:
 
     async def _run[T](self, operation: Callable[[], Awaitable[T]]) -> T:
         try:
-            if self.config.keychain_service and (os.environ.get("DEBUG") or os.environ.get("PWDEBUG")):
+            if self.config.has_credentials and (os.environ.get("DEBUG") or os.environ.get("PWDEBUG")):
                 raise StatsError("unsafe_debug_config", "Unset DEBUG and PWDEBUG before enabling credential-based login.")
             async with asyncio.timeout(self.config.timeout_seconds):
                 if self.config.browser_mode == "managed":
-                    self.config.profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    if self.config.profile_dir.stat().st_mode & 0o077:
+                    self.profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if self.profile_dir.stat().st_mode & 0o077:
                         raise StatsError("invalid_config", "The managed profile must be private (directory mode 0700).")
-                async with self._lock, profile_lock(self.config.profile_dir):
+                async with self._lock, profile_lock(self.profile_dir):
                     return await operation()
         except TimeoutError as error:
             raise StatsError("timeout", "The live query timed out; no cached or partial result was substituted.") from error
@@ -268,15 +291,15 @@ class FusionSolarSource:
     @asynccontextmanager
     async def _browser_context(self, driver: Playwright) -> AsyncIterator[BrowserContext]:
         if self.config.browser_mode == "attach":
-            port = debugging_port(self.config.profile_dir)
+            port = debugging_port(self.profile_dir)
             browser = await driver.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
             if not browser.contexts:
                 raise StatsError("authentication_required", "No authenticated browser context is available.")
             yield browser.contexts[0]
         else:
             context = await driver.chromium.launch_persistent_context(
-                str(self.config.profile_dir), channel="chrome", headless=self.config.headless,
-                timeout=20000, args=["--restore-last-session"],
+                str(self.profile_dir), channel="chrome", headless=self.config.headless,
+                timeout=20000, args=["--restore-last-session"], timezone_id=self.config.time_zone,
             )
             try:
                 yield context
@@ -338,7 +361,7 @@ class FusionSolarSource:
             state = await self._portal_state(page)
         except BrowserTimeoutError:
             if (
-                not self.config.keychain_service
+                not self.config.has_credentials
                 or not self.config.is_plant_page(page.url)
                 or (await page.locator("body").inner_text()).strip()
             ):
@@ -356,10 +379,15 @@ class FusionSolarSource:
             raise StatsError("authentication_required", "Complete the FusionSolar MFA/CAPTCHA challenge manually.")
         if state != "login":
             raise StatsError("authentication_required", "The configured plant report is not available from this application.")
-        if not self.config.keychain_service:
-            raise StatsError("authentication_required", "Sign in to the dedicated browser or configure Keychain login.")
+        if not self.config.has_credentials:
+            raise StatsError("authentication_required", "Sign in to the dedicated browser or configure a login source.")
         self._check_login_origin(page)
-        credentials = await keychain_credentials(self.config.keychain_service)
+        if self.config.login_source == "environment":
+            credentials = environment_credentials()
+        elif self.config.keychain_service is not None:
+            credentials = await keychain_credentials(self.config.keychain_service)
+        else:
+            raise StatsError("invalid_config", "No credential source was configured.")
         popup: asyncio.Future[Page] = asyncio.get_running_loop().create_future()
         opened: list[Page] = []
         accepted: Page | None = None
@@ -416,7 +444,7 @@ class FusionSolarSource:
                 seed = next(
                     (tab for tab in reversed(context.pages) if self.config.is_application_page(tab.url)), None
                 )
-            if seed is None and self.config.browser_mode == "attach" and not self.config.keychain_service:
+            if seed is None and self.config.browser_mode == "attach" and not self.config.has_credentials:
                 raise StatsError("authentication_required", "Open the configured plant in the signed-in dedicated browser.")
             if self.config.browser_mode == "managed":
                 page = seed or (context.pages[0] if context.pages else await context.new_page())

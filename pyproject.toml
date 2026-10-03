@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solar-mcp"
-version = "0.7.1"
+version = "0.8.0"
 description = "Huawei inverter telemetry, generation caps, and FusionSolar history over MCP"
 readme = "README.md"
 license = "AGPL-3.0-only"
